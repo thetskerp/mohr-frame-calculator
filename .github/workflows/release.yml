@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag, for example v0.5.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Create Windows archive
+        shell: pwsh
+        run: |
+          $bundle = "release-package\Mohr Frame"
+          New-Item -ItemType Directory -Force $bundle | Out-Null
+          Copy-Item "target\release\mohr-frame.exe" "$bundle\Mohr Frame.exe"
+          Copy-Item "examples\example-frame.mohr.ron" "$bundle\example-frame.mohr.ron"
+          Copy-Item "README.md" "$bundle\README.md"
+          Copy-Item "LICENSE" "$bundle\LICENSE"
+          Copy-Item "assets\OpenGost-LICENSE.txt" "$bundle\OpenGost-LICENSE.txt"
+          Compress-Archive -Path $bundle -DestinationPath "Mohr-Frame-Windows-x64.zip"
+
+      - name: Upload Windows archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: Mohr-Frame-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: macOS Universal
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust and targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build Intel binary
+        run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Build Apple Silicon binary
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Create universal app archive
+        run: |
+          BUNDLE_DIR="release-package/Mohr Frame"
+          APP_DIR="$BUNDLE_DIR/Mohr Frame.app"
+          mkdir -p "$APP_DIR/Contents/MacOS"
+          lipo -create \
+            target/x86_64-apple-darwin/release/mohr-frame \
+            target/aarch64-apple-darwin/release/mohr-frame \
+            -output "$APP_DIR/Contents/MacOS/mohr-frame"
+          cp packaging/macos/Info.plist "$APP_DIR/Contents/Info.plist"
+          chmod +x "$APP_DIR/Contents/MacOS/mohr-frame"
+          /usr/bin/codesign --force --deep --sign - "$APP_DIR"
+          cp examples/example-frame.mohr.ron "$BUNDLE_DIR/example-frame.mohr.ron"
+          cp README.md "$BUNDLE_DIR/README.md"
+          cp LICENSE "$BUNDLE_DIR/LICENSE"
+          cp assets/OpenGost-LICENSE.txt "$BUNDLE_DIR/OpenGost-LICENSE.txt"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$BUNDLE_DIR" "Mohr-Frame-macOS-universal.zip"
+
+      - name: Verify universal binary
+        run: lipo -info "release-package/Mohr Frame/Mohr Frame.app/Contents/MacOS/mohr-frame"
+
+      - name: Upload macOS archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: Mohr-Frame-macOS-universal.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-release"
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create SHA-256 checksums
+        run: |
+          cd release-assets
+          sha256sum *.zip > SHA256SUMS.txt
+
+      - name: Create or update release
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --verify-tag \
+              --title "Mohr Frame $RELEASE_TAG" \
+              --generate-notes
+          fi

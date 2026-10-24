@@ -4,6 +4,10 @@ version = "0.5.0"
 edition = "2021"
 description = "Графический расчет перемещений плоской стержневой рамы методом Мора"
 license = "MIT"
+repository = "https://github.com/thetskerp/mohr-frame-calculator"
+readme = "README.md"
+keywords = ["structural-mechanics", "mohr", "frame", "engineering"]
+categories = ["science", "visualization"]
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence", "system_fonts", "wayland", "x11"] }

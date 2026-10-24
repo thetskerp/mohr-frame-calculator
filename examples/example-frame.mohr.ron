@@ -1,0 +1,268 @@
+(
+    format_version: 1,
+    model: (
+        nodes: [
+            (
+                id: "A",
+                position: (
+                    x: 0.0,
+                    y: 0.0,
+                ),
+            ),
+            (
+                id: "B",
+                position: (
+                    x: 0.0,
+                    y: 2.0,
+                ),
+            ),
+            (
+                id: "C",
+                position: (
+                    x: 2.0,
+                    y: 2.0,
+                ),
+            ),
+            (
+                id: "D",
+                position: (
+                    x: 2.0,
+                    y: 0.0,
+                ),
+            ),
+        ],
+        rods: [
+            (
+                id: "AB",
+                start_node: 0,
+                end_node: 1,
+                rigidity_factor: 1.0,
+                normal_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    right: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+                shear_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    right: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+                load_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    right: (
+                        magnitude: 20.0,
+                        fiber: UpperOrLeft,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+                unit_x_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    right: (
+                        magnitude: 2.0,
+                        fiber: UpperOrLeft,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+                unit_y_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    right: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+            ),
+            (
+                id: "BC",
+                start_node: 1,
+                end_node: 2,
+                rigidity_factor: 2.0,
+                normal_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    right: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+                shear_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    right: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+                load_diagram: (
+                    kind: Parabolic,
+                    left: (
+                        magnitude: 20.0,
+                        fiber: UpperOrLeft,
+                    ),
+                    right: (
+                        magnitude: 40.0,
+                        fiber: UpperOrLeft,
+                    ),
+                    q: Some(5.0),
+                    q_fiber: Some(LowerOrRight),
+                    has_extremum: false,
+                ),
+                unit_x_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 2.0,
+                        fiber: UpperOrLeft,
+                    ),
+                    right: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+                unit_y_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    right: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+            ),
+            (
+                id: "CD",
+                start_node: 2,
+                end_node: 3,
+                rigidity_factor: 1.0,
+                normal_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    right: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+                shear_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    right: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+                load_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 40.0,
+                        fiber: UpperOrLeft,
+                    ),
+                    right: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+                unit_x_diagram: (
+                    kind: Constant,
+                    left: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    right: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+                unit_y_diagram: (
+                    kind: Linear,
+                    left: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    right: (
+                        magnitude: 0.0,
+                        fiber: OnAxis,
+                    ),
+                    q: None,
+                    q_fiber: None,
+                    has_extremum: false,
+                ),
+            ),
+        ],
+        target_node: 1,
+    ),
+    rigidity: Symbolic,
+    show_values: true,
+)
