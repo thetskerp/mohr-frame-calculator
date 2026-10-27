@@ -353,7 +353,7 @@ pub struct Node {
     pub position: Point,
 }
 
-/// Стержень между двумя узлами с грузовой и двумя единичными эпюрами.
+/// Стержень между двумя узлами с грузовой и тремя единичными эпюрами.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Rod {
     pub id: String,
@@ -373,6 +373,9 @@ pub struct Rod {
     pub unit_x_diagram: Diagram,
     /// Эпюра от единичной вертикальной силы в выбранном узле.
     pub unit_y_diagram: Diagram,
+    /// Эпюра от единичного положительного момента в выбранном узле.
+    #[serde(default)]
+    pub unit_rotation_diagram: Diagram,
 }
 
 /// Узловая модель рамы и точка, перемещения которой определяются.
@@ -388,6 +391,7 @@ pub struct StructuralModel {
 pub enum DisplacementDirection {
     Horizontal,
     Vertical,
+    Rotation,
 }
 
 impl StructuralModel {
@@ -496,6 +500,7 @@ impl StructuralModel {
             let unit_diagram = match direction {
                 DisplacementDirection::Horizontal => rod.unit_x_diagram.clone(),
                 DisplacementDirection::Vertical => rod.unit_y_diagram.clone(),
+                DisplacementDirection::Rotation => rod.unit_rotation_diagram.clone(),
             };
             segments.push(Segment {
                 id: rod.id.clone(),
@@ -567,11 +572,12 @@ pub struct CalculationResult {
     pub rigidity: Rigidity,
 }
 
-/// Два независимых интеграла Мора для выбранной точки.
+/// Два линейных перемещения и поворот выбранной точки.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplacementComponents {
     pub horizontal: CalculationResult,
     pub vertical: CalculationResult,
+    pub rotation: CalculationResult,
 }
 
 impl CalculationResult {
@@ -672,16 +678,18 @@ pub fn calculate_displacement(
     })
 }
 
-/// Вычисляет горизонтальное и вертикальное перемещения выбранной точки.
+/// Вычисляет горизонтальное, вертикальное перемещения и поворот выбранной точки.
 pub fn calculate_displacement_components(
     model: &StructuralModel,
     rigidity: Rigidity,
 ) -> Result<DisplacementComponents, String> {
     let horizontal_frame = model.frame_for(DisplacementDirection::Horizontal)?;
     let vertical_frame = model.frame_for(DisplacementDirection::Vertical)?;
+    let rotation_frame = model.frame_for(DisplacementDirection::Rotation)?;
     Ok(DisplacementComponents {
         horizontal: calculate_displacement(&horizontal_frame, rigidity)?,
         vertical: calculate_displacement(&vertical_frame, rigidity)?,
+        rotation: calculate_displacement(&rotation_frame, rigidity)?,
     })
 }
 
@@ -882,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn node_model_derives_length_and_two_components() {
+    fn node_model_derives_length_and_three_components() {
         let model = StructuralModel {
             nodes: vec![
                 Node {
@@ -904,6 +912,7 @@ mod tests {
                 load_diagram: linear(2.0, 2.0),
                 unit_x_diagram: linear(3.0, 3.0),
                 unit_y_diagram: linear(-1.0, -1.0),
+                unit_rotation_diagram: linear(0.5, 0.5),
             }],
             target_node: 1,
         };
@@ -911,6 +920,7 @@ mod tests {
         let result = calculate_displacement_components(&model, Rigidity::Symbolic).unwrap();
         assert!((result.horizontal.numerator - 12.0).abs() < EPS);
         assert!((result.vertical.numerator + 4.0).abs() < EPS);
+        assert!((result.rotation.numerator - 2.0).abs() < EPS);
     }
 
     #[test]

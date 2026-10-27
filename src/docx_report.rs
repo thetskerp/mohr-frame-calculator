@@ -20,7 +20,13 @@ pub fn build_word_report(model: &StructuralModel, rigidity: Rigidity) -> Result<
     model.validate()?;
     let results = calculate_displacement_components(model, rigidity)?;
     let scheme_png = render_scheme_png(model)?;
-    let document_xml = build_document_xml(model, rigidity, &results.horizontal, &results.vertical)?;
+    let document_xml = build_document_xml(
+        model,
+        rigidity,
+        &results.horizontal,
+        &results.vertical,
+        &results.rotation,
+    )?;
 
     let mut archive = StoredZip::default();
     archive.add("[Content_Types].xml", content_types_xml().as_bytes());
@@ -42,21 +48,23 @@ fn build_document_xml(
     rigidity: Rigidity,
     horizontal: &CalculationResult,
     vertical: &CalculationResult,
+    rotation: &CalculationResult,
 ) -> Result<String, String> {
     let target = &model.nodes[model.target_node].id;
     let mut body = String::new();
 
     body.push_str(&paragraph(
-        "Расчёт силовых перемещений плоской стержневой рамы методом Мора",
+        "Расчёт силовых перемещений и поворота точки плоской стержневой рамы методом Мора",
         Some("Title"),
         true,
     ));
     body.push_str(&paragraph(
         &format!(
-            "Отчёт содержит исходную геометрию, заданные эпюры и вычисление горизонтального и вертикального перемещений точки {}. Итоговые значения: Δx = {}; Δy = {}.",
+            "Отчёт содержит исходную геометрию, заданные эпюры и вычисление горизонтального, вертикального перемещений и поворота точки {}. Итоговые значения: Δx = {}; Δy = {}; φ = {}.",
             xml_escape(target),
             xml_escape(&displacement_views(horizontal)),
-            xml_escape(&displacement_views(vertical))
+            xml_escape(&displacement_views(vertical)),
+            xml_escape(&displacement_views(rotation))
         ),
         None,
         false,
@@ -130,8 +138,8 @@ fn build_document_xml(
     body.push_str(image_paragraph());
     body.push_str(&caption("Рисунок 1  Геометрия рамы и размеры стержней"));
 
-    body.push_str(&heading("Расчёт силового перемещения", 1));
-    body.push_str(&math_paragraph("δ = Σ ∫ Mₚ m₁ / (EIᵢ) dx"));
+    body.push_str(&heading("Расчёт силовых перемещений и поворота", 1));
+    body.push_str(&math_paragraph("Δx, Δy, φ = Σ ∫ Mₚ m₁ / (EIᵢ) dx"));
     body.push_str(empty_paragraph());
     body.push_str(&paragraph(
         "На линейных и постоянных участках применяется аналитическое перемножение трапеций. Если хотя бы одна эпюра параболическая, используется трёхточечная формула Симпсона. Различие жёсткостей учитывается делением вклада участка на коэффициент k.",
@@ -155,6 +163,7 @@ fn build_document_xml(
         vertical,
         4,
     );
+    append_component(&mut body, model, "Поворот точки", "φ", rotation, 5);
 
     body.push_str(&heading("Итог", 1));
     body.push_str(&final_result_paragraph(&format!(
@@ -167,8 +176,13 @@ fn build_document_xml(
         target,
         displacement_views(vertical)
     )));
+    body.push_str(&final_result_paragraph(&format!(
+        "Точка {}: φ = {}",
+        target,
+        displacement_views(rotation)
+    )));
     body.push_str(&paragraph(
-        "Знак результата соответствует направлениям глобальных осей X и Y расчётной схемы.",
+        "Знаки Δx и Δy соответствуют направлениям глобальных осей X и Y. Положительный поворот φ направлен против часовой стрелки.",
         None,
         false,
     ));
@@ -931,6 +945,7 @@ mod tests {
                 .unwrap(),
                 unit_x_diagram: zero(),
                 unit_y_diagram: zero(),
+                unit_rotation_diagram: zero(),
             }],
             target_node: 1,
         }
@@ -946,6 +961,9 @@ mod tests {
         assert!(bytes
             .windows("word/media/frame.png".len())
             .any(|part| part == b"word/media/frame.png"));
+        assert!(bytes
+            .windows("Поворот точки".len())
+            .any(|part| part == "Поворот точки".as_bytes()));
     }
 
     #[test]

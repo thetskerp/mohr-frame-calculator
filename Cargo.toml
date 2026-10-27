@@ -1,6 +1,6 @@
 [package]
 name = "mohr-frame"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Графический расчет перемещений плоской стержневой рамы методом Мора"
 license = "MIT"

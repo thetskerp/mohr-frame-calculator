@@ -1,28 +1,29 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod canvas;
 mod docx_report;
+mod project;
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::sync::Arc;
 
+use canvas::{frame_canvas, CanvasOptions, CanvasViewState, DiagramChoice, GOST_FONT_FAMILY};
 use docx_report::build_word_report;
 use eframe::egui::{
-    self, Align2, Color32, ComboBox, DragValue, FontData, FontDefinitions, FontFamily, FontId,
-    Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2,
+    self, Align2, Color32, ComboBox, DragValue, FontData, FontDefinitions, FontFamily, RichText,
+    Vec2,
 };
 use mohr_frame::{
     calculate_displacement_components, format_number, CalculationResult, Diagram, DiagramKind,
     FiberSide, Frame, Node, Ordinate, Point, Rigidity, Rod, SegmentOrientation, StructuralModel,
 };
+use project::{
+    export_for_v050, load_project, project_paths, project_root_dir, sanitize_project_name_input,
+    save_project, save_word_report, ProjectData,
+};
 use serde::{Deserialize, Serialize};
 
 const APP_KEY: &str = "mohr-frame-gui";
 const STORAGE_KEY: &str = "frame_app_state";
-const PROJECT_FORMAT_VERSION: u32 = 1;
-const GOST_FONT_FAMILY: &str = "gost_type_a";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 enum WorkspaceTab {
@@ -33,18 +34,13 @@ enum WorkspaceTab {
     KinematicDisplacement,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PortableProject {
-    format_version: u32,
-    model: StructuralModel,
-    rigidity: Rigidity,
-    show_values: bool,
-}
-
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Метод Мора — перемещения точки рамы")
+            .with_title(format!(
+                "Метод Мора v{} — перемещения и поворот точки рамы",
+                env!("CARGO_PKG_VERSION")
+            ))
             .with_inner_size([1380.0, 860.0])
             .with_min_inner_size([1040.0, 680.0]),
         centered: true,
@@ -70,9 +66,11 @@ struct MohrApp {
     #[serde(default = "default_true")]
     show_values: bool,
     #[serde(default)]
+    canvas_view: CanvasViewState,
+    #[serde(default)]
     active_tab: WorkspaceTab,
-    #[serde(default = "default_project_filename")]
-    project_filename: String,
+    #[serde(default = "default_project_name", alias = "project_filename")]
+    project_name: String,
     #[serde(skip)]
     project_message: String,
     #[serde(skip)]
@@ -92,8 +90,9 @@ impl Default for MohrApp {
             selected_node: 0,
             selected_rod: 0,
             show_values: true,
+            canvas_view: CanvasViewState::default(),
             active_tab: WorkspaceTab::Diagrams,
-            project_filename: default_project_filename(),
+            project_name: default_project_name(),
             project_message: String::new(),
             project_message_is_error: false,
             confirm_clear: false,
@@ -117,6 +116,10 @@ impl MohrApp {
         {
             app.model = migrate_legacy_frame(std::mem::take(&mut app.legacy_frame));
         }
+        app.project_name = sanitize_project_name_input(&app.project_name);
+        if app.project_name.trim().is_empty() {
+            app.project_name = default_project_name();
+        }
         app.clamp_selection();
         app
     }
@@ -134,28 +137,17 @@ impl MohrApp {
             .min(self.model.nodes.len().saturating_sub(1));
     }
 
-    fn portable_project(&self) -> PortableProject {
-        PortableProject {
-            format_version: PROJECT_FORMAT_VERSION,
+    fn project_data(&self) -> ProjectData {
+        ProjectData {
             model: self.model.clone(),
             rigidity: self.rigidity,
             show_values: self.show_values,
+            view_state: self.canvas_view.clone(),
         }
     }
 
     fn save_project_file(&mut self) {
-        let result = (|| -> Result<PathBuf, String> {
-            self.model.validate()?;
-            let path = project_path(&self.project_filename)?;
-            let text = ron::ser::to_string_pretty(
-                &self.portable_project(),
-                ron::ser::PrettyConfig::default(),
-            )
-            .map_err(|error| format!("не удалось подготовить файл: {error}"))?;
-            fs::write(&path, text)
-                .map_err(|error| format!("не удалось сохранить {}: {error}", path.display()))?;
-            Ok(path)
-        })();
+        let result = save_project(&self.project_name, &self.project_data());
         match result {
             Ok(path) => {
                 self.project_message = format!("Сохранено: {}", path.display());
@@ -169,28 +161,22 @@ impl MohrApp {
     }
 
     fn open_project_file(&mut self) {
-        let result = (|| -> Result<(PortableProject, PathBuf), String> {
-            let path = project_path(&self.project_filename)?;
-            let text = fs::read_to_string(&path)
-                .map_err(|error| format!("не удалось открыть {}: {error}", path.display()))?;
-            let project: PortableProject = ron::from_str(&text)
-                .map_err(|error| format!("файл проекта поврежден или несовместим: {error}"))?;
-            if project.format_version != PROJECT_FORMAT_VERSION {
-                return Err(format!(
-                    "версия файла {} не поддерживается (ожидается {})",
-                    project.format_version, PROJECT_FORMAT_VERSION
-                ));
-            }
-            project.model.validate()?;
-            Ok((project, path))
-        })();
+        let result = load_project(&self.project_name);
         match result {
-            Ok((project, path)) => {
-                self.model = project.model;
-                self.rigidity = project.rigidity;
-                self.show_values = project.show_values;
+            Ok(loaded) => {
+                self.model = loaded.data.model;
+                self.rigidity = loaded.data.rigidity;
+                self.show_values = loaded.data.show_values;
+                self.canvas_view = loaded.data.view_state;
                 self.clamp_selection();
-                self.project_message = format!("Открыто: {}", path.display());
+                self.project_message = if loaded.migrated_from_legacy {
+                    format!(
+                        "Открыт проект v0.5.0: {}. При сохранении будет создан новый формат.",
+                        loaded.path.display()
+                    )
+                } else {
+                    format!("Открыто: {}", loaded.path.display())
+                };
                 self.project_message_is_error = false;
             }
             Err(error) => {
@@ -201,13 +187,10 @@ impl MohrApp {
     }
 
     fn export_word_report(&mut self) {
-        let result = (|| -> Result<PathBuf, String> {
+        let result = (|| {
             self.model.validate()?;
             let bytes = build_word_report(&self.model, self.rigidity)?;
-            let path = report_path(&self.project_filename)?;
-            fs::write(&path, bytes)
-                .map_err(|error| format!("не удалось сохранить {}: {error}", path.display()))?;
-            Ok(path)
+            save_word_report(&self.project_name, &bytes)
         })();
         match result {
             Ok(path) => {
@@ -221,12 +204,29 @@ impl MohrApp {
         }
     }
 
+    fn export_legacy_project(&mut self) {
+        match export_for_v050(&self.project_name, &self.project_data()) {
+            Ok(path) => {
+                self.project_message = format!(
+                    "Совместимая копия v0.5.0 сохранена: {}. Эпюра mφ, поворот и вид холста в неё не входят.",
+                    path.display()
+                );
+                self.project_message_is_error = false;
+            }
+            Err(error) => {
+                self.project_message = format!("Экспорт v0.5.0: {error}");
+                self.project_message_is_error = true;
+            }
+        }
+    }
+
     fn clear_workspace(&mut self) {
         self.model = StructuralModel::default();
         self.rigidity = Rigidity::Symbolic;
         self.selected_node = 0;
         self.selected_rod = 0;
         self.show_values = true;
+        self.canvas_view.reset();
         self.active_tab = WorkspaceTab::Diagrams;
         self.project_message =
             "Рабочее полотно очищено. Сохранённые файлы проекта не удалены.".into();
@@ -244,7 +244,7 @@ impl MohrApp {
                 ui.selectable_value(
                     &mut self.active_tab,
                     WorkspaceTab::ForceDisplacement,
-                    "2. Силовое перемещение",
+                    "2. Силовые перемещения и поворот",
                 );
                 ui.selectable_value(
                     &mut self.active_tab,
@@ -259,8 +259,16 @@ impl MohrApp {
             });
             ui.separator();
             ui.horizontal_wrapped(|ui| {
-                ui.label("Файл проекта:");
-                ui.add(egui::TextEdit::singleline(&mut self.project_filename).desired_width(190.0));
+                ui.label("Имя проекта:");
+                let name_response = ui.add(
+                    egui::TextEdit::singleline(&mut self.project_name)
+                        .desired_width(160.0)
+                        .char_limit(64),
+                );
+                if name_response.changed() {
+                    self.project_name = sanitize_project_name_input(&self.project_name);
+                }
+                ui.monospace(".mohr.ron");
                 if ui.button("Сохранить").clicked() {
                     self.save_project_file();
                 }
@@ -269,6 +277,15 @@ impl MohrApp {
                 }
                 if ui.button("Экспорт Word").clicked() {
                     self.export_word_report();
+                }
+                if ui
+                    .button("Экспорт v0.5.0")
+                    .on_hover_text(
+                        "Создать отдельную копию без mφ и масштаба холста, которую откроет v0.5.0",
+                    )
+                    .clicked()
+                {
+                    self.export_legacy_project();
                 }
                 if ui
                     .add(
@@ -281,8 +298,14 @@ impl MohrApp {
                 {
                     self.confirm_clear = true;
                 }
-                ui.small(format!("Папка: {}", project_root_dir().display()));
+                let folder = project_paths(&self.project_name)
+                    .map(|paths| paths.directory)
+                    .unwrap_or_else(|_| project_root_dir());
+                ui.small(format!("Папка проекта: {}", folder.display()));
             });
+            ui.small(
+                "Холст: колесо — масштаб рамы • ЛКМ — перемещение • Shift+колесо — высота эпюры • двойной щелчок — сброс",
+            );
             if !self.project_message.is_empty() {
                 let color = if self.project_message_is_error {
                     Color32::LIGHT_RED
@@ -392,6 +415,7 @@ impl MohrApp {
             load_diagram: zero_diagram(),
             unit_x_diagram: zero_diagram(),
             unit_y_diagram: zero_diagram(),
+            unit_rotation_diagram: zero_diagram(),
         });
         self.selected_rod = self.model.rods.len() - 1;
     }
@@ -425,7 +449,7 @@ impl MohrApp {
                         ui.checkbox(&mut self.show_values, "Показывать ординаты");
                         if tab == WorkspaceTab::ForceDisplacement {
                             ui.small(
-                                "mx и my задаются от единичных сил в выбранной точке по X и Y.",
+                                "mx и my задаются от единичных сил, mφ — от единичного положительного момента (против часовой стрелки) в выбранной точке.",
                             );
                         } else {
                             ui.small("Эпюры M, N и Q сохраняются в переносимом файле проекта.");
@@ -478,7 +502,7 @@ impl MohrApp {
         }
 
         ui.horizontal(|ui| {
-            ui.label("Искомое перемещение точки:");
+            ui.label("Искомые перемещения точки:");
             ComboBox::from_id_salt("target_node")
                 .selected_text(
                     self.model
@@ -532,97 +556,136 @@ impl MohrApp {
         }
     }
 
-    fn show_force_panel(&self, root_ui: &mut egui::Ui) {
+    fn show_force_panel(&mut self, root_ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(root_ui, |ui| {
             result_header(ui, &self.model, self.rigidity);
             ui.add_space(6.0);
-            let row_height = ((ui.available_height() - 8.0) / 2.0).max(230.0);
-            ui.columns(2, |columns| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let row_height = 230.0;
+                ui.columns(2, |columns| {
+                    frame_canvas(
+                        &mut columns[0],
+                        &self.model,
+                        CanvasOptions {
+                            title: "Геометрия и выбранная точка",
+                            diagram: None,
+                            height: row_height,
+                            show_values: self.show_values,
+                            show_dimensions: true,
+                        },
+                        &mut self.canvas_view,
+                    );
+                    frame_canvas(
+                        &mut columns[1],
+                        &self.model,
+                        CanvasOptions {
+                            title: "Грузовая эпюра Mp",
+                            diagram: Some(DiagramChoice::Load),
+                            height: row_height,
+                            show_values: self.show_values,
+                            show_dimensions: false,
+                        },
+                        &mut self.canvas_view,
+                    );
+                });
+                ui.add_space(6.0);
+                ui.columns(2, |columns| {
+                    frame_canvas(
+                        &mut columns[0],
+                        &self.model,
+                        CanvasOptions {
+                            title: "Единичная эпюра mx → Δx",
+                            diagram: Some(DiagramChoice::UnitX),
+                            height: row_height,
+                            show_values: self.show_values,
+                            show_dimensions: false,
+                        },
+                        &mut self.canvas_view,
+                    );
+                    frame_canvas(
+                        &mut columns[1],
+                        &self.model,
+                        CanvasOptions {
+                            title: "Единичная эпюра my → Δy",
+                            diagram: Some(DiagramChoice::UnitY),
+                            height: row_height,
+                            show_values: self.show_values,
+                            show_dimensions: false,
+                        },
+                        &mut self.canvas_view,
+                    );
+                });
+                ui.add_space(6.0);
                 frame_canvas(
-                    &mut columns[0],
-                    "Геометрия и выбранная точка",
+                    ui,
                     &self.model,
-                    None,
-                    row_height,
-                    self.show_values,
-                    true,
-                );
-                frame_canvas(
-                    &mut columns[1],
-                    "Грузовая эпюра Mp",
-                    &self.model,
-                    Some(DiagramChoice::Load),
-                    row_height,
-                    self.show_values,
-                    false,
-                );
-            });
-            ui.add_space(6.0);
-            ui.columns(2, |columns| {
-                frame_canvas(
-                    &mut columns[0],
-                    "Единичная эпюра mx → Δx",
-                    &self.model,
-                    Some(DiagramChoice::UnitX),
-                    row_height,
-                    self.show_values,
-                    false,
-                );
-                frame_canvas(
-                    &mut columns[1],
-                    "Единичная эпюра my → Δy",
-                    &self.model,
-                    Some(DiagramChoice::UnitY),
-                    row_height,
-                    self.show_values,
-                    false,
+                    CanvasOptions {
+                        title: "Единичная эпюра mφ → поворот φ",
+                        diagram: Some(DiagramChoice::UnitRotation),
+                        height: row_height,
+                        show_values: self.show_values,
+                        show_dimensions: false,
+                    },
+                    &mut self.canvas_view,
                 );
             });
         });
     }
 
-    fn show_diagrams_panel(&self, root_ui: &mut egui::Ui) {
+    fn show_diagrams_panel(&mut self, root_ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(root_ui, |ui| {
             let row_height = ((ui.available_height() - 8.0) / 2.0).max(230.0);
             ui.columns(2, |columns| {
                 frame_canvas(
                     &mut columns[0],
-                    "Расчётная схема",
                     &self.model,
-                    None,
-                    row_height,
-                    self.show_values,
-                    false,
+                    CanvasOptions {
+                        title: "Расчётная схема",
+                        diagram: None,
+                        height: row_height,
+                        show_values: self.show_values,
+                        show_dimensions: false,
+                    },
+                    &mut self.canvas_view,
                 );
                 frame_canvas(
                     &mut columns[1],
-                    "Эпюра изгибающих моментов M",
                     &self.model,
-                    Some(DiagramChoice::Load),
-                    row_height,
-                    self.show_values,
-                    false,
+                    CanvasOptions {
+                        title: "Эпюра изгибающих моментов M",
+                        diagram: Some(DiagramChoice::Load),
+                        height: row_height,
+                        show_values: self.show_values,
+                        show_dimensions: false,
+                    },
+                    &mut self.canvas_view,
                 );
             });
             ui.add_space(6.0);
             ui.columns(2, |columns| {
                 frame_canvas(
                     &mut columns[0],
-                    "Эпюра продольных сил N",
                     &self.model,
-                    Some(DiagramChoice::Normal),
-                    row_height,
-                    self.show_values,
-                    false,
+                    CanvasOptions {
+                        title: "Эпюра продольных сил N",
+                        diagram: Some(DiagramChoice::Normal),
+                        height: row_height,
+                        show_values: self.show_values,
+                        show_dimensions: false,
+                    },
+                    &mut self.canvas_view,
                 );
                 frame_canvas(
                     &mut columns[1],
-                    "Эпюра поперечных сил Q",
                     &self.model,
-                    Some(DiagramChoice::Shear),
-                    row_height,
-                    self.show_values,
-                    false,
+                    CanvasOptions {
+                        title: "Эпюра поперечных сил Q",
+                        diagram: Some(DiagramChoice::Shear),
+                        height: row_height,
+                        show_values: self.show_values,
+                        show_dimensions: false,
+                    },
+                    &mut self.canvas_view,
                 );
             });
         });
@@ -724,6 +787,18 @@ fn result_header(ui: &mut egui::Ui, model: &StructuralModel, rigidity: Rigidity)
                         );
                     });
                     ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Поворот φ = {}",
+                                displacement_views(&result.rotation)
+                            ))
+                            .size(22.0)
+                            .strong()
+                            .color(Color32::from_rgb(235, 190, 95)),
+                        );
+                        ui.small("положительное направление — против часовой стрелки");
+                    });
+                    ui.horizontal_wrapped(|ui| {
                         ui.small(format!(
                             "X: Σ∫Mp·mx dx = {}",
                             format_number(result.horizontal.numerator)
@@ -732,6 +807,11 @@ fn result_header(ui: &mut egui::Ui, model: &StructuralModel, rigidity: Rigidity)
                         ui.small(format!(
                             "Y: Σ∫Mp·my dx = {}",
                             format_number(result.vertical.numerator)
+                        ));
+                        ui.separator();
+                        ui.small(format!(
+                            "φ: Σ∫Mp·mφ dx = {}",
+                            format_number(result.rotation.numerator)
                         ));
                     });
                     ui.horizontal_wrapped(|ui| {
@@ -748,6 +828,18 @@ fn result_header(ui: &mut egui::Ui, model: &StructuralModel, rigidity: Rigidity)
                         ui.separator();
                         ui.small("Вклады Y с учетом EI участка:");
                         for item in &result.vertical.contributions {
+                            ui.small(format!(
+                                "{}: {}/{} = {}",
+                                item.segment_id,
+                                format_number(item.raw_integral),
+                                format_number(item.rigidity_factor),
+                                format_number(item.integral)
+                            ));
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small("Вклады φ с учетом EI участка:");
+                        for item in &result.rotation.contributions {
                             ui.small(format!(
                                 "{}: {}/{} = {}",
                                 item.segment_id,
@@ -862,6 +954,11 @@ fn rod_editor(
                     .default_open(false)
                     .show(ui, |ui| {
                         diagram_editor(ui, &mut rod.unit_y_diagram, length, (unique_id, 4));
+                    });
+                egui::CollapsingHeader::new("Единичная эпюра mφ (поворот)")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        diagram_editor(ui, &mut rod.unit_rotation_diagram, length, (unique_id, 5));
                     });
             }
             WorkspaceTab::ThermalDisplacement | WorkspaceTab::KinematicDisplacement => {}
@@ -986,284 +1083,6 @@ fn clear_parabola(diagram: &mut Diagram) {
     diagram.has_extremum = false;
 }
 
-#[derive(Debug, Clone, Copy)]
-enum DiagramChoice {
-    Load,
-    Normal,
-    Shear,
-    UnitX,
-    UnitY,
-}
-
-fn frame_canvas(
-    ui: &mut egui::Ui,
-    title: &str,
-    model: &StructuralModel,
-    diagram_choice: Option<DiagramChoice>,
-    height: f32,
-    show_values: bool,
-    show_dimensions: bool,
-) {
-    egui::Frame::canvas(ui.style()).show(ui, |ui| {
-        ui.label(RichText::new(title).strong());
-        let size = Vec2::new(ui.available_width(), height - 26.0);
-        let (response, painter) = ui.allocate_painter(size, Sense::hover());
-        let rect = response.rect.shrink(12.0);
-        painter.rect_filled(rect, 4.0, Color32::from_rgb(18, 22, 29));
-        if model.nodes.is_empty() {
-            painter.text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                "Добавьте точки",
-                FontId::proportional(15.0),
-                Color32::GRAY,
-            );
-            return;
-        }
-        let transform = CanvasTransform::new(model, rect);
-        if let Some(choice) = diagram_choice {
-            draw_diagrams(&painter, model, &transform, choice, show_values);
-        }
-        draw_baselines(&painter, model, &transform);
-        if show_dimensions {
-            draw_dimensions(&painter, model, &transform);
-        }
-        draw_nodes(&painter, model, &transform);
-    });
-}
-
-fn draw_dimensions(painter: &egui::Painter, model: &StructuralModel, transform: &CanvasTransform) {
-    if model.nodes.is_empty() {
-        return;
-    }
-    let center = model
-        .nodes
-        .iter()
-        .map(|node| transform.point(node.position).to_vec2())
-        .fold(Vec2::ZERO, |sum, point| sum + point)
-        / model.nodes.len() as f32;
-    let stroke = Stroke::new(1.0, Color32::from_gray(165));
-    for rod in &model.rods {
-        let Some((start_point, end_point, length)) = rod_geometry(model, rod) else {
-            continue;
-        };
-        let start = transform.point(start_point);
-        let end = transform.point(end_point);
-        let direction = end - start;
-        let unit = direction / direction.length().max(1.0e-6);
-        let mut normal = Vec2::new(-unit.y, unit.x);
-        let midpoint = start.lerp(end, 0.5);
-        if normal.dot(midpoint.to_vec2() - center) < 0.0 {
-            normal = -normal;
-        }
-        let offset = 26.0;
-        let dim_start = start + normal * offset;
-        let dim_end = end + normal * offset;
-        painter.line_segment([start + normal * 7.0, dim_start + normal * 5.0], stroke);
-        painter.line_segment([end + normal * 7.0, dim_end + normal * 5.0], stroke);
-        painter.line_segment([dim_start, dim_end], stroke);
-
-        // Засечки по ЕСКД вместо стрелочных наконечников.
-        let tick = (unit + normal).normalized() * 6.0;
-        painter.line_segment([dim_start - tick, dim_start + tick], stroke);
-        painter.line_segment([dim_end - tick, dim_end + tick], stroke);
-        painter.text(
-            dim_start.lerp(dim_end, 0.5) + normal * 4.0,
-            Align2::CENTER_BOTTOM,
-            format_number(length),
-            FontId::new(13.0, FontFamily::Name(GOST_FONT_FAMILY.into())),
-            Color32::from_gray(205),
-        );
-    }
-}
-
-fn draw_baselines(painter: &egui::Painter, model: &StructuralModel, transform: &CanvasTransform) {
-    for rod in &model.rods {
-        let (Some(start_node), Some(end_node)) = (
-            model.nodes.get(rod.start_node),
-            model.nodes.get(rod.end_node),
-        ) else {
-            continue;
-        };
-        let start = transform.point(start_node.position);
-        let end = transform.point(end_node.position);
-        painter.line_segment([start, end], Stroke::new(3.0, Color32::from_gray(205)));
-        painter.text(
-            start.lerp(end, 0.5) + Vec2::new(5.0, -8.0),
-            Align2::LEFT_BOTTOM,
-            &rod.id,
-            FontId::proportional(12.0),
-            Color32::WHITE,
-        );
-    }
-}
-
-fn draw_nodes(painter: &egui::Painter, model: &StructuralModel, transform: &CanvasTransform) {
-    for (index, node) in model.nodes.iter().enumerate() {
-        let point = transform.point(node.position);
-        let is_target = index == model.target_node;
-        let color = if is_target {
-            Color32::from_rgb(255, 205, 70)
-        } else {
-            Color32::WHITE
-        };
-        painter.circle_filled(point, if is_target { 5.5 } else { 4.0 }, color);
-        if is_target {
-            painter.circle_stroke(point, 9.0, Stroke::new(1.5, color));
-        }
-        painter.text(
-            point + Vec2::new(6.0, 5.0),
-            Align2::LEFT_TOP,
-            &node.id,
-            FontId::proportional(12.0),
-            color,
-        );
-    }
-}
-
-fn draw_diagrams(
-    painter: &egui::Painter,
-    model: &StructuralModel,
-    transform: &CanvasTransform,
-    choice: DiagramChoice,
-    show_values: bool,
-) {
-    let color = match choice {
-        DiagramChoice::Load => Color32::from_rgb(244, 145, 75),
-        DiagramChoice::Normal => Color32::from_rgb(190, 125, 235),
-        DiagramChoice::Shear => Color32::from_rgb(235, 205, 85),
-        DiagramChoice::UnitX => Color32::from_rgb(76, 180, 235),
-        DiagramChoice::UnitY => Color32::from_rgb(110, 220, 170),
-    };
-    let max_abs = model
-        .rods
-        .iter()
-        .filter_map(|rod| rod_geometry(model, rod).map(|(_, _, length)| (rod, length)))
-        .flat_map(|(rod, length)| {
-            let diagram = selected_diagram(rod, choice);
-            (0..=32).map(move |index| diagram.value_at(length, index as f64 / 32.0).abs())
-        })
-        .fold(0.0_f64, f64::max)
-        .max(1.0e-12);
-    let diagram_scale = transform.rect.height() * 0.22 / max_abs as f32;
-
-    for rod in &model.rods {
-        let Some((start_point, end_point, length)) = rod_geometry(model, rod) else {
-            continue;
-        };
-        let diagram = selected_diagram(rod, choice);
-        let start = transform.point(start_point);
-        let end = transform.point(end_point);
-        let direction = end - start;
-        let unit = direction / direction.length().max(1.0e-6);
-        let normal = Vec2::new(-unit.y, unit.x);
-        let mut curve = Vec::with_capacity(33);
-        let mut previous: Option<(Pos2, Pos2)> = None;
-        for index in 0..=32 {
-            let t = index as f32 / 32.0;
-            let baseline = start.lerp(end, t);
-            let value = diagram.value_at(length, t as f64) as f32;
-            let point = baseline + normal * value * diagram_scale;
-            if let Some((previous_baseline, previous_point)) = previous {
-                painter.add(Shape::convex_polygon(
-                    vec![previous_baseline, baseline, point, previous_point],
-                    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 38),
-                    Stroke::NONE,
-                ));
-            }
-            curve.push(point);
-            previous = Some((baseline, point));
-        }
-        painter.add(Shape::line(curve, Stroke::new(2.2, color)));
-        for t in [0.0_f32, 0.5, 1.0] {
-            let baseline = start.lerp(end, t);
-            let value = diagram.value_at(length, t as f64);
-            let point = baseline + normal * value as f32 * diagram_scale;
-            painter.line_segment(
-                [baseline, point],
-                Stroke::new(1.0, color.gamma_multiply(0.75)),
-            );
-            painter.circle_filled(point, 2.8, color);
-            if show_values {
-                painter.text(
-                    point + normal * value.signum() as f32 * 5.0,
-                    if value >= 0.0 {
-                        Align2::CENTER_TOP
-                    } else {
-                        Align2::CENTER_BOTTOM
-                    },
-                    format_number(value),
-                    FontId::monospace(11.0),
-                    color,
-                );
-            }
-        }
-    }
-}
-
-fn selected_diagram(rod: &Rod, choice: DiagramChoice) -> &Diagram {
-    match choice {
-        DiagramChoice::Load => &rod.load_diagram,
-        DiagramChoice::Normal => &rod.normal_diagram,
-        DiagramChoice::Shear => &rod.shear_diagram,
-        DiagramChoice::UnitX => &rod.unit_x_diagram,
-        DiagramChoice::UnitY => &rod.unit_y_diagram,
-    }
-}
-
-fn rod_geometry(model: &StructuralModel, rod: &Rod) -> Option<(Point, Point, f64)> {
-    let start = model.nodes.get(rod.start_node)?.position;
-    let end = model.nodes.get(rod.end_node)?.position;
-    let length = (end.x - start.x).hypot(end.y - start.y);
-    (length > 1.0e-12).then_some((start, end, length))
-}
-
-struct CanvasTransform {
-    min_x: f64,
-    max_y: f64,
-    scale: f32,
-    origin: Pos2,
-    rect: Rect,
-}
-
-impl CanvasTransform {
-    fn new(model: &StructuralModel, rect: Rect) -> Self {
-        let (mut min_x, mut max_x) = (f64::INFINITY, f64::NEG_INFINITY);
-        let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
-        for node in &model.nodes {
-            min_x = min_x.min(node.position.x);
-            max_x = max_x.max(node.position.x);
-            min_y = min_y.min(node.position.y);
-            max_y = max_y.max(node.position.y);
-        }
-        let width = (max_x - min_x).max(1.0);
-        let height = (max_y - min_y).max(1.0);
-        let scale = ((rect.width() * 0.66) / width as f32)
-            .min((rect.height() * 0.58) / height as f32)
-            .max(1.0e-6);
-        let drawn_width = (max_x - min_x) as f32 * scale;
-        let drawn_height = (max_y - min_y) as f32 * scale;
-        let origin = Pos2::new(
-            rect.center().x - drawn_width / 2.0,
-            rect.center().y - drawn_height / 2.0,
-        );
-        Self {
-            min_x,
-            max_y,
-            scale,
-            origin,
-            rect,
-        }
-    }
-
-    fn point(&self, point: Point) -> Pos2 {
-        Pos2::new(
-            self.origin.x + (point.x - self.min_x) as f32 * self.scale,
-            self.origin.y + (self.max_y - point.y) as f32 * self.scale,
-        )
-    }
-}
-
 fn default_model() -> StructuralModel {
     StructuralModel {
         nodes: vec![
@@ -1286,6 +1105,7 @@ fn default_model() -> StructuralModel {
             load_diagram: zero_diagram(),
             unit_x_diagram: zero_diagram(),
             unit_y_diagram: zero_diagram(),
+            unit_rotation_diagram: zero_diagram(),
         }],
         target_node: 1,
     }
@@ -1310,6 +1130,7 @@ fn migrate_legacy_frame(frame: Frame) -> StructuralModel {
             load_diagram: segment.load_diagram,
             unit_x_diagram: segment.unit_diagram,
             unit_y_diagram: zero_diagram(),
+            unit_rotation_diagram: zero_diagram(),
         });
     }
     StructuralModel {
@@ -1385,67 +1206,8 @@ fn symbolic_rigidity() -> Rigidity {
     Rigidity::Symbolic
 }
 
-fn default_project_filename() -> String {
-    "scheme.mohr.ron".into()
-}
-
-fn project_path(filename: &str) -> Result<PathBuf, String> {
-    let filename = filename.trim();
-    if filename.is_empty() {
-        return Err("задайте имя файла проекта".into());
-    }
-    let path = Path::new(filename);
-    if path.components().count() != 1 {
-        return Err("укажите только имя файла без пути к другой папке".into());
-    }
-    let mut name = filename.to_owned();
-    if path.extension().is_none() {
-        name.push_str(".mohr.ron");
-    }
-    Ok(project_root_dir().join(name))
-}
-
-fn report_path(project_filename: &str) -> Result<PathBuf, String> {
-    let filename = project_filename.trim();
-    if filename.is_empty() {
-        return Err("задайте имя файла проекта".into());
-    }
-    let path = Path::new(filename);
-    if path.components().count() != 1 {
-        return Err("укажите только имя файла без пути к другой папке".into());
-    }
-    let stem = filename
-        .strip_suffix(".mohr.ron")
-        .or_else(|| filename.strip_suffix(".ron"))
-        .unwrap_or(filename)
-        .trim_end_matches(".docx");
-    if stem.is_empty() {
-        return Err("имя отчёта не может быть пустым".into());
-    }
-    Ok(project_root_dir().join(format!("{stem}-report.docx")))
-}
-
-fn project_root_dir() -> PathBuf {
-    if let Ok(current) = std::env::current_dir() {
-        if current.join("Cargo.toml").is_file() {
-            return current;
-        }
-    }
-    let Some(executable_dir) = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-    else {
-        return PathBuf::from(".");
-    };
-    if executable_dir.ends_with(Path::new("Contents/MacOS")) {
-        let fallback = executable_dir.clone();
-        return executable_dir
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .map_or(fallback, Path::to_path_buf);
-    }
-    executable_dir
+fn default_project_name() -> String {
+    "scheme".into()
 }
 
 fn default_true() -> bool {
@@ -1480,42 +1242,13 @@ mod tests {
     }
 
     #[test]
-    fn portable_project_roundtrip_preserves_the_complete_model() {
-        let app = MohrApp::default();
-        let source = app.portable_project();
-        let text = ron::ser::to_string_pretty(&source, ron::ser::PrettyConfig::default()).unwrap();
-        let restored: PortableProject = ron::from_str(&text).unwrap();
-
-        assert_eq!(restored.format_version, PROJECT_FORMAT_VERSION);
-        assert_eq!(restored.model, source.model);
-        assert_eq!(restored.rigidity, source.rigidity);
-        assert_eq!(restored.show_values, source.show_values);
-    }
-
-    #[test]
-    fn project_filename_cannot_escape_the_project_folder() {
-        assert!(project_path("scheme.mohr.ron").is_ok());
-        assert!(project_path("../scheme.mohr.ron").is_err());
-        assert!(project_path("").is_err());
-    }
-
-    #[test]
-    fn report_filename_is_derived_from_project_name() {
-        assert_eq!(
-            report_path("scheme.mohr.ron").unwrap().file_name().unwrap(),
-            "scheme-report.docx"
-        );
-        assert!(report_path("../scheme.mohr.ron").is_err());
-    }
-
-    #[test]
-    fn clearing_workspace_removes_geometry_but_keeps_project_filename() {
+    fn clearing_workspace_removes_geometry_but_keeps_project_name() {
         let mut app = MohrApp::default();
-        let filename = app.project_filename.clone();
+        let project_name = app.project_name.clone();
         app.clear_workspace();
         assert!(app.model.nodes.is_empty());
         assert!(app.model.rods.is_empty());
-        assert_eq!(app.project_filename, filename);
+        assert_eq!(app.project_name, project_name);
         assert_eq!(app.active_tab, WorkspaceTab::Diagrams);
     }
 }
