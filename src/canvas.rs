@@ -24,6 +24,9 @@ pub enum DiagramChoice {
     UnitX,
     UnitY,
     UnitRotation,
+    UnitNormalX,
+    UnitNormalY,
+    UnitNormalRotation,
 }
 
 impl DiagramChoice {
@@ -35,6 +38,9 @@ impl DiagramChoice {
             Self::UnitX => 3,
             Self::UnitY => 4,
             Self::UnitRotation => 5,
+            Self::UnitNormalX => 6,
+            Self::UnitNormalY => 7,
+            Self::UnitNormalRotation => 8,
         }
     }
 }
@@ -64,8 +70,8 @@ impl CanvasCamera {
     }
 }
 
-fn default_ordinate_scales() -> [f32; 6] {
-    [1.0; 6]
+fn default_ordinate_scales() -> Vec<f32> {
+    vec![1.0; 9]
 }
 
 /// Сохраняемое состояние вида: общая камера и отдельная
@@ -75,7 +81,7 @@ pub struct CanvasViewState {
     #[serde(default)]
     pub camera: CanvasCamera,
     #[serde(default = "default_ordinate_scales")]
-    pub ordinate_scales: [f32; 6],
+    pub ordinate_scales: Vec<f32>,
     /// Служебные данные текущего жеста не входят в файл проекта.
     #[serde(skip)]
     drag_origin: Option<DragOrigin>,
@@ -103,10 +109,16 @@ impl CanvasViewState {
     }
 
     fn diagram_scale(&self, choice: DiagramChoice) -> f32 {
-        self.ordinate_scales[choice.index()]
+        self.ordinate_scales
+            .get(choice.index())
+            .copied()
+            .unwrap_or(1.0)
     }
 
     fn scale_diagram(&mut self, choice: DiagramChoice, factor: f32) {
+        if self.ordinate_scales.len() < 9 {
+            self.ordinate_scales.resize(9, 1.0);
+        }
         let scale = &mut self.ordinate_scales[choice.index()];
         *scale = (*scale * factor).clamp(MIN_DIAGRAM_SCALE, MAX_DIAGRAM_SCALE);
     }
@@ -118,6 +130,7 @@ pub struct CanvasOptions<'a> {
     pub height: f32,
     pub show_values: bool,
     pub show_dimensions: bool,
+    pub show_temperatures: bool,
 }
 
 pub fn frame_canvas(
@@ -212,6 +225,9 @@ pub fn frame_canvas(
         draw_baselines(&painter, model, &transform);
         if options.show_dimensions {
             draw_dimensions(&painter, model, &transform);
+        }
+        if options.show_temperatures {
+            draw_temperatures(&painter, model, &transform);
         }
         draw_nodes(&painter, model, &transform);
     });
@@ -335,6 +351,9 @@ fn draw_diagrams(
         DiagramChoice::UnitX => Color32::from_rgb(76, 180, 235),
         DiagramChoice::UnitY => Color32::from_rgb(110, 220, 170),
         DiagramChoice::UnitRotation => Color32::from_rgb(235, 190, 95),
+        DiagramChoice::UnitNormalX => Color32::from_rgb(105, 180, 255),
+        DiagramChoice::UnitNormalY => Color32::from_rgb(125, 235, 185),
+        DiagramChoice::UnitNormalRotation => Color32::from_rgb(255, 210, 115),
     };
     let max_abs = model
         .rods
@@ -410,6 +429,58 @@ fn selected_diagram(rod: &Rod, choice: DiagramChoice) -> &Diagram {
         DiagramChoice::UnitX => &rod.unit_x_diagram,
         DiagramChoice::UnitY => &rod.unit_y_diagram,
         DiagramChoice::UnitRotation => &rod.unit_rotation_diagram,
+        DiagramChoice::UnitNormalX => &rod.unit_normal_x_diagram,
+        DiagramChoice::UnitNormalY => &rod.unit_normal_y_diagram,
+        DiagramChoice::UnitNormalRotation => &rod.unit_normal_rotation_diagram,
+    }
+}
+
+fn draw_temperatures(
+    painter: &egui::Painter,
+    model: &StructuralModel,
+    transform: &CanvasTransform,
+) {
+    for rod in &model.rods {
+        let (Some(temperature), Some((start_point, end_point, _))) =
+            (rod.temperature, rod_geometry(model, rod))
+        else {
+            continue;
+        };
+        let start = transform.point(start_point);
+        let end = transform.point(end_point);
+        let direction = end - start;
+        let unit = direction / direction.length().max(1.0e-6);
+        // Экранный образ нормали в сторону «верх/лево».
+        let side_one = Vec2::new(unit.y, -unit.x);
+        let midpoint = start.lerp(end, 0.5);
+        let color = Color32::from_rgb(255, 145, 105);
+        painter.text(
+            midpoint + side_one * 25.0,
+            Align2::CENTER_CENTER,
+            format!("t₁={}°", format_number(temperature.upper_or_left)),
+            FontId::proportional(12.0),
+            color,
+        );
+        painter.text(
+            midpoint - side_one * 25.0,
+            Align2::CENTER_CENTER,
+            format!("t₂={}°", format_number(temperature.lower_or_right)),
+            FontId::proportional(12.0),
+            color,
+        );
+        painter.text(
+            midpoint + unit * 3.0,
+            Align2::CENTER_TOP,
+            format!(
+                "t′={}; t₀={}; h={}; kα={}",
+                format_number(temperature.difference()),
+                format_number(temperature.mean()),
+                format_number(rod.section_height),
+                format_number(rod.thermal_expansion_factor)
+            ),
+            FontId::proportional(11.0),
+            Color32::from_gray(205),
+        );
     }
 }
 

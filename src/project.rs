@@ -6,18 +6,22 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mohr_frame::{Diagram, Node, Rigidity, StructuralModel};
+use mohr_frame::{Diagram, EffectsSelection, Node, Rigidity, StructuralModel, ThermalExpansion};
 use serde::{Deserialize, Serialize};
 
 use crate::canvas::CanvasViewState;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 const PROJECT_FORMAT_ID: &str = "mohr-frame-project";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectData {
     pub model: StructuralModel,
     pub rigidity: Rigidity,
+    #[serde(default)]
+    pub thermal_expansion: ThermalExpansion,
+    #[serde(default)]
+    pub effects: EffectsSelection,
     pub show_values: bool,
     #[serde(default)]
     pub view_state: CanvasViewState,
@@ -78,7 +82,7 @@ pub fn save_project(project_name: &str, data: &ProjectData) -> Result<PathBuf, S
         format: PROJECT_FORMAT_ID.into(),
         schema_version: CURRENT_SCHEMA_VERSION,
         created_with: env!("CARGO_PKG_VERSION").into(),
-        minimum_reader: "0.5.1".into(),
+        minimum_reader: "0.6.0".into(),
         data: data.clone(),
     };
     let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::default())
@@ -173,7 +177,7 @@ pub(crate) fn deserialize_project_text(text: &str) -> Result<(ProjectData, bool)
                 "файл создан более новой версией программы (schema {schema_version}); обновите Mohr Frame"
             ));
         }
-        if schema_version != CURRENT_SCHEMA_VERSION {
+        if schema_version < 2 {
             return Err(format!("версия схемы {schema_version} не поддерживается"));
         }
         let file: ProjectFileV2 =
@@ -182,7 +186,7 @@ pub(crate) fn deserialize_project_text(text: &str) -> Result<(ProjectData, bool)
             return Err(format!("неизвестный формат проекта: {}", file.format));
         }
         file.data.model.validate()?;
-        return Ok((file.data, false));
+        return Ok((file.data, schema_version < CURRENT_SCHEMA_VERSION));
     }
 
     if probe.format_version == 1 {
@@ -196,6 +200,8 @@ pub(crate) fn deserialize_project_text(text: &str) -> Result<(ProjectData, bool)
             ProjectData {
                 model: legacy.model,
                 rigidity: legacy.rigidity,
+                thermal_expansion: ThermalExpansion::Symbolic,
+                effects: EffectsSelection::default(),
                 show_values: legacy.show_values,
                 view_state: CanvasViewState::default(),
             },
@@ -379,16 +385,24 @@ mod tests {
                     start_node: 0,
                     end_node: 1,
                     rigidity_factor: 1.0,
+                    section_height: 0.5,
+                    thermal_expansion_factor: 1.0,
+                    temperature: None,
                     normal_diagram: Diagram::default(),
                     shear_diagram: Diagram::default(),
                     load_diagram: Diagram::default(),
                     unit_x_diagram: Diagram::default(),
                     unit_y_diagram: Diagram::default(),
                     unit_rotation_diagram: Diagram::default(),
+                    unit_normal_x_diagram: Diagram::default(),
+                    unit_normal_y_diagram: Diagram::default(),
+                    unit_normal_rotation_diagram: Diagram::default(),
                 }],
                 target_node: 1,
             },
             rigidity: Rigidity::Symbolic,
+            thermal_expansion: ThermalExpansion::Symbolic,
+            effects: EffectsSelection::default(),
             show_values: true,
             view_state: CanvasViewState::default(),
         }
@@ -445,6 +459,30 @@ mod tests {
             .rods
             .iter()
             .all(|rod| rod.unit_rotation_diagram == Diagram::default()));
+        assert!(restored.model.rods.iter().all(|rod| {
+            rod.section_height == 0.5
+                && rod.thermal_expansion_factor == 1.0
+                && rod.temperature.is_none()
+                && rod.unit_normal_x_diagram == Diagram::default()
+                && rod.unit_normal_y_diagram == Diagram::default()
+                && rod.unit_normal_rotation_diagram == Diagram::default()
+        }));
+        assert_eq!(restored.thermal_expansion, ThermalExpansion::Symbolic);
+        assert_eq!(restored.effects, EffectsSelection::default());
+    }
+
+    #[test]
+    fn v051_schema_is_accepted_and_marked_for_migration() {
+        let file = ProjectFileV2 {
+            format: PROJECT_FORMAT_ID.into(),
+            schema_version: 2,
+            created_with: "0.5.1".into(),
+            minimum_reader: "0.5.1".into(),
+            data: sample_data(),
+        };
+        let text = ron::ser::to_string(&file).unwrap();
+        let (_, migrated) = deserialize_project_text(&text).unwrap();
+        assert!(migrated);
     }
 
     #[test]

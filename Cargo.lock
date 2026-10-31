@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "mohr-frame"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "eframe",
  "image",

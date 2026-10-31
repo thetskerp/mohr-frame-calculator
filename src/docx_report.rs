@@ -8,25 +8,27 @@ use std::io::Cursor;
 
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use mohr_frame::{
-    calculate_displacement_components, format_number, CalculationResult, Diagram,
-    IntegrationMethod, Rigidity, StructuralModel,
+    calculate_displacement_components, calculate_thermal_displacement_components, format_number,
+    CalculationResult, Diagram, DisplacementComponents, EffectsSelection, IntegrationMethod,
+    Rigidity, StructuralModel, ThermalCalculationResult, ThermalDisplacementComponents,
+    ThermalExpansion,
 };
 
 const REPORT_IMAGE_WIDTH: u32 = 1000;
 const REPORT_IMAGE_HEIGHT: u32 = 650;
 
 /// Создаёт готовый DOCX-отчёт в памяти.
-pub fn build_word_report(model: &StructuralModel, rigidity: Rigidity) -> Result<Vec<u8>, String> {
+pub fn build_word_report(
+    model: &StructuralModel,
+    rigidity: Rigidity,
+    expansion: ThermalExpansion,
+    effects: EffectsSelection,
+) -> Result<Vec<u8>, String> {
     model.validate()?;
     let results = calculate_displacement_components(model, rigidity)?;
+    let thermal = calculate_thermal_displacement_components(model, expansion)?;
     let scheme_png = render_scheme_png(model)?;
-    let document_xml = build_document_xml(
-        model,
-        rigidity,
-        &results.horizontal,
-        &results.vertical,
-        &results.rotation,
-    )?;
+    let document_xml = build_document_xml(model, rigidity, expansion, effects, &results, &thermal)?;
 
     let mut archive = StoredZip::default();
     archive.add("[Content_Types].xml", content_types_xml().as_bytes());
@@ -46,25 +48,29 @@ pub fn build_word_report(model: &StructuralModel, rigidity: Rigidity) -> Result<
 fn build_document_xml(
     model: &StructuralModel,
     rigidity: Rigidity,
-    horizontal: &CalculationResult,
-    vertical: &CalculationResult,
-    rotation: &CalculationResult,
+    expansion: ThermalExpansion,
+    effects: EffectsSelection,
+    force: &DisplacementComponents,
+    thermal: &ThermalDisplacementComponents,
 ) -> Result<String, String> {
+    let horizontal = &force.horizontal;
+    let vertical = &force.vertical;
+    let rotation = &force.rotation;
     let target = &model.nodes[model.target_node].id;
     let mut body = String::new();
 
     body.push_str(&paragraph(
-        "Расчёт силовых перемещений и поворота точки плоской стержневой рамы методом Мора",
+        "Расчёт перемещений и поворота точки плоской стержневой рамы",
         Some("Title"),
         true,
     ));
     body.push_str(&paragraph(
         &format!(
-            "Отчёт содержит исходную геометрию, заданные эпюры и вычисление горизонтального, вертикального перемещений и поворота точки {}. Итоговые значения: Δx = {}; Δy = {}; φ = {}.",
+            "Отчёт содержит раздельный расчёт силового и температурного воздействий для точки {}. Итоговые значения: Δx = {}; Δy = {}; φ = {}.",
             xml_escape(target),
-            xml_escape(&displacement_views(horizontal)),
-            xml_escape(&displacement_views(vertical)),
-            xml_escape(&displacement_views(rotation))
+            xml_escape(&combined_value(horizontal, &thermal.horizontal, effects)),
+            xml_escape(&combined_value(vertical, &thermal.vertical, effects)),
+            xml_escape(&combined_value(rotation, &thermal.rotation, effects))
         ),
         None,
         false,
@@ -75,6 +81,14 @@ fn build_document_xml(
         &format!(
             "Базовая изгибная жёсткость: {}. Для каждого стержня EI участка равно коэффициенту k, умноженному на базовое EI.",
             xml_escape(&rigidity_text(rigidity))
+        ),
+        None,
+        false,
+    ));
+    body.push_str(&paragraph(
+        &format!(
+            "Базовый коэффициент температурного расширения: {}. Для стержня αᵢ = kα·α. Температурное слагаемое: α·Σkα·[(t₂−t₁)/h·∫m ds + t₀·∫n ds].",
+            xml_escape(&expansion_text(expansion))
         ),
         None,
         false,
@@ -102,32 +116,45 @@ fn build_document_xml(
     body.push_str(&table(&["№", "Точка", "x", "y", "Назначение"], &node_rows));
 
     let mut rod_rows = Vec::with_capacity(model.rods.len());
+    let mut diagram_rows = Vec::with_capacity(model.rods.len());
     for rod in &model.rods {
         let start = &model.nodes[rod.start_node].id;
         let end = &model.nodes[rod.end_node].id;
         let length = model.rod_length(rod)?;
+        let temperature = rod.temperature.unwrap_or_default();
         rod_rows.push(vec![
             rod.id.clone(),
             format!("{start}–{end}"),
             format_number(length),
             format_number(rod.rigidity_factor),
+            format_number(rod.section_height),
+            format_number(rod.thermal_expansion_factor),
+            if rod.temperature.is_some() {
+                format!(
+                    "{}; {}",
+                    format_number(temperature.upper_or_left),
+                    format_number(temperature.lower_or_right)
+                )
+            } else {
+                "нет".into()
+            },
+        ]);
+        diagram_rows.push(vec![
+            rod.id.clone(),
             diagram_values(&rod.load_diagram, length),
             diagram_values(&rod.normal_diagram, length),
             diagram_values(&rod.shear_diagram, length),
         ]);
     }
-    body.push_str(&caption("Таблица 2  Стержни и эпюры"));
+    body.push_str(&caption("Таблица 2  Геометрия и параметры стержней"));
     body.push_str(&table(
-        &[
-            "Стержень",
-            "Узлы",
-            "L",
-            "k",
-            "M  L; L/2; R",
-            "N  L; L/2; R",
-            "Q  L; L/2; R",
-        ],
+        &["Стержень", "Узлы", "L", "kEI", "h", "kα", "t₁; t₂"],
         &rod_rows,
+    ));
+    body.push_str(&caption("Таблица 3  Заданные эпюры M, N и Q"));
+    body.push_str(&table(
+        &["Стержень", "M  L; L/2; R", "N  L; L/2; R", "Q  L; L/2; R"],
+        &diagram_rows,
     ));
 
     body.push_str(page_break());
@@ -139,6 +166,15 @@ fn build_document_xml(
     body.push_str(&caption("Рисунок 1  Геометрия рамы и размеры стержней"));
 
     body.push_str(&heading("Расчёт силовых перемещений и поворота", 1));
+    body.push_str(&paragraph(
+        if effects.force {
+            "Силовое воздействие включено в итог."
+        } else {
+            "Силовое воздействие рассчитано, но не включено в итог."
+        },
+        None,
+        false,
+    ));
     body.push_str(&math_paragraph("Δx, Δy, φ = Σ ∫ Mₚ m₁ / (EIᵢ) dx"));
     body.push_str(empty_paragraph());
     body.push_str(&paragraph(
@@ -153,7 +189,7 @@ fn build_document_xml(
         "Горизонтальное перемещение",
         "Δx",
         horizontal,
-        3,
+        4,
     );
     append_component(
         &mut body,
@@ -161,25 +197,80 @@ fn build_document_xml(
         "Вертикальное перемещение",
         "Δy",
         vertical,
-        4,
+        5,
     );
-    append_component(&mut body, model, "Поворот точки", "φ", rotation, 5);
+    append_component(&mut body, model, "Поворот точки", "φ", rotation, 6);
+
+    body.push_str(page_break());
+    body.push_str(&heading("Расчёт температурных перемещений", 1));
+    body.push_str(&math_paragraph("ΔT = α·Σ kα·[(t₂−t₁)·∫m ds/h + t₀·∫n ds]"));
+    body.push_str(&paragraph(
+        if effects.thermal {
+            "Температурное воздействие включено в итог. t′ = |t₁−t₂| приводится в исходных данных; знак изгиба определяется выражением t₂−t₁."
+        } else {
+            "Температурное воздействие рассчитано, но не включено в итог. t′ = |t₁−t₂| приводится в исходных данных; знак изгиба определяется выражением t₂−t₁."
+        },
+        None,
+        false,
+    ));
+    append_thermal_component(
+        &mut body,
+        "Горизонтальное температурное перемещение",
+        "Δx(T)",
+        &thermal.horizontal,
+        7,
+    );
+    append_thermal_component(
+        &mut body,
+        "Вертикальное температурное перемещение",
+        "Δy(T)",
+        &thermal.vertical,
+        8,
+    );
+    append_thermal_component(
+        &mut body,
+        "Температурный поворот точки",
+        "φ(T)",
+        &thermal.rotation,
+        9,
+    );
 
     body.push_str(&heading("Итог", 1));
+    let summary_rows = vec![
+        vec![
+            "Силовое".into(),
+            included_value(effects.force, &displacement_views(horizontal)),
+            included_value(effects.force, &displacement_views(vertical)),
+            included_value(effects.force, &displacement_views(rotation)),
+        ],
+        vec![
+            "Температурное".into(),
+            included_value(
+                effects.thermal,
+                &thermal.horizontal.formatted_displacement(),
+            ),
+            included_value(effects.thermal, &thermal.vertical.formatted_displacement()),
+            included_value(effects.thermal, &thermal.rotation.formatted_displacement()),
+        ],
+        vec![
+            "Кинематическое".into(),
+            "0 (не реализовано)".into(),
+            "0 (не реализовано)".into(),
+            "0 (не реализовано)".into(),
+        ],
+        vec![
+            "ИТОГО".into(),
+            combined_value(horizontal, &thermal.horizontal, effects),
+            combined_value(vertical, &thermal.vertical, effects),
+            combined_value(rotation, &thermal.rotation, effects),
+        ],
+    ];
+    body.push_str(&table(&["Воздействие", "Δx", "Δy", "φ"], &summary_rows));
     body.push_str(&final_result_paragraph(&format!(
-        "Точка {}: Δx = {}",
-        target,
-        displacement_views(horizontal)
-    )));
-    body.push_str(&final_result_paragraph(&format!(
-        "Точка {}: Δy = {}",
-        target,
-        displacement_views(vertical)
-    )));
-    body.push_str(&final_result_paragraph(&format!(
-        "Точка {}: φ = {}",
-        target,
-        displacement_views(rotation)
+        "Точка {target}: Δx = {}; Δy = {}; φ = {}",
+        combined_value(horizontal, &thermal.horizontal, effects),
+        combined_value(vertical, &thermal.vertical, effects),
+        combined_value(rotation, &thermal.rotation, effects),
     )));
     body.push_str(&paragraph(
         "Знаки Δx и Δy соответствуют направлениям глобальных осей X и Y. Положительный поворот φ направлен против часовой стрелки.",
@@ -275,6 +366,150 @@ fn append_component(
     )));
 }
 
+fn append_thermal_component(
+    body: &mut String,
+    title: &str,
+    symbol: &str,
+    result: &ThermalCalculationResult,
+    table_number: usize,
+) {
+    body.push_str(&heading(title, 2));
+    let rows = result
+        .contributions
+        .iter()
+        .map(|item| {
+            vec![
+                item.rod_id.clone(),
+                if item.active {
+                    "да".into()
+                } else {
+                    "нет".into()
+                },
+                format_number(item.section_height),
+                format_number(item.expansion_factor),
+                format!(
+                    "{}; {}",
+                    format_number(item.upper_or_left),
+                    format_number(item.lower_or_right)
+                ),
+                format!(
+                    "{}; {}",
+                    format_number(item.temperature_difference),
+                    format_number(item.mean_temperature)
+                ),
+                format_number(item.bending_term),
+                format_number(item.axial_term),
+                format_number(item.coefficient),
+            ]
+        })
+        .collect::<Vec<_>>();
+    body.push_str(&caption(&format!(
+        "Таблица {table_number}  Температурные вклады стержней в {symbol}"
+    )));
+    body.push_str(&table(
+        &[
+            "Стержень",
+            "T",
+            "h",
+            "kα",
+            "t₁; t₂",
+            "t′; t₀",
+            "Изгиб",
+            "Ось",
+            "Сумма",
+        ],
+        &rows,
+    ));
+    body.push_str(&keep_next_paragraph(
+        "Подробная подстановка по каждому стержню, включая нулевые слагаемые:",
+    ));
+    for item in &result.contributions {
+        body.push_str(&calculation_paragraph(&format!(
+            "Стержень {}: t′=|{}−{}|={}; t₂−t₁={}; t₀=({}+{})/2={}",
+            item.rod_id,
+            format_number(item.upper_or_left),
+            format_number(item.lower_or_right),
+            format_number(item.temperature_difference),
+            format_number(item.signed_gradient),
+            format_number(item.upper_or_left),
+            format_number(item.lower_or_right),
+            format_number(item.mean_temperature),
+        )));
+        body.push_str(&calculation_paragraph(&format!(
+            "α·{}·[({}/{})·{} + {}·{}] = α·{}·[{} + {}] = α·{}{}",
+            format_number(item.expansion_factor),
+            format_number(item.signed_gradient),
+            format_number(item.section_height),
+            format_number(item.unit_moment_area),
+            format_number(item.mean_temperature),
+            format_number(item.unit_normal_area),
+            format_number(item.expansion_factor),
+            format_number(item.bending_term),
+            format_number(item.axial_term),
+            format_number(item.coefficient),
+            if item.active {
+                ""
+            } else {
+                " (температурное воздействие выключено)"
+            },
+        )));
+    }
+    let sum = result
+        .contributions
+        .iter()
+        .map(|item| format_number(item.coefficient))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    body.push_str(&calculation_paragraph(&format!(
+        "Сумма: α·({sum}) = {}",
+        result.formatted_displacement()
+    )));
+    body.push_str(&result_paragraph(&format!(
+        "{symbol} = {}",
+        result.formatted_displacement()
+    )));
+}
+
+fn included_value(included: bool, value: &str) -> String {
+    if included {
+        value.into()
+    } else {
+        "0 (не включено)".into()
+    }
+}
+
+fn combined_value(
+    force: &CalculationResult,
+    thermal: &ThermalCalculationResult,
+    effects: EffectsSelection,
+) -> String {
+    let force_numeric = effects
+        .force
+        .then(|| force.numeric_displacement())
+        .flatten();
+    let thermal_numeric = effects
+        .thermal
+        .then(|| thermal.numeric_displacement())
+        .flatten();
+    let all_selected_numeric = (!effects.force || force_numeric.is_some())
+        && (!effects.thermal || thermal_numeric.is_some());
+    if all_selected_numeric {
+        return format_number(force_numeric.unwrap_or(0.0) + thermal_numeric.unwrap_or(0.0));
+    }
+    let mut terms = Vec::new();
+    if effects.force && force.numerator.abs() > 1.0e-12 {
+        terms.push(force.formatted_displacement());
+    }
+    if effects.thermal && thermal.coefficient.abs() > 1.0e-12 {
+        terms.push(thermal.formatted_displacement());
+    }
+    if terms.is_empty() {
+        "0".into()
+    } else {
+        terms.join(" + ")
+    }
+}
+
 fn integration_formula(method: IntegrationMethod) -> &'static str {
     match method {
         IntegrationMethod::TrapezoidalProduct => {
@@ -327,6 +562,15 @@ fn rigidity_text(rigidity: Rigidity) -> String {
     match rigidity {
         Rigidity::Symbolic => "аналитическая константа EI".into(),
         Rigidity::Numeric(value) => format!("EI = {}", format_number(value)),
+    }
+}
+
+fn expansion_text(expansion: ThermalExpansion) -> String {
+    match expansion {
+        ThermalExpansion::Symbolic => "аналитическая константа α".into(),
+        ThermalExpansion::Numeric(value) => {
+            format!("α = {} 1/°C", format_number(value))
+        }
     }
 }
 
@@ -490,7 +734,7 @@ fn core_properties_xml() -> &'static str {
 }
 
 fn app_properties_xml() -> &'static str {
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.5.0</AppVersion></Properties>"#
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.6.0</AppVersion></Properties>"#
 }
 
 fn styles_xml() -> &'static str {
@@ -932,6 +1176,9 @@ mod tests {
                 start_node: 0,
                 end_node: 1,
                 rigidity_factor: 1.0,
+                section_height: 0.5,
+                thermal_expansion_factor: 1.0,
+                temperature: None,
                 normal_diagram: zero(),
                 shear_diagram: zero(),
                 load_diagram: Diagram::new(
@@ -946,6 +1193,9 @@ mod tests {
                 unit_x_diagram: zero(),
                 unit_y_diagram: zero(),
                 unit_rotation_diagram: zero(),
+                unit_normal_x_diagram: zero(),
+                unit_normal_y_diagram: zero(),
+                unit_normal_rotation_diagram: zero(),
             }],
             target_node: 1,
         }
@@ -953,7 +1203,13 @@ mod tests {
 
     #[test]
     fn report_is_a_docx_container_with_document_and_image() {
-        let bytes = build_word_report(&model(), Rigidity::Symbolic).unwrap();
+        let bytes = build_word_report(
+            &model(),
+            Rigidity::Symbolic,
+            ThermalExpansion::Symbolic,
+            EffectsSelection::default(),
+        )
+        .unwrap();
         assert!(bytes.starts_with(b"PK\x03\x04"));
         assert!(bytes
             .windows("word/document.xml".len())
@@ -964,6 +1220,53 @@ mod tests {
         assert!(bytes
             .windows("Поворот точки".len())
             .any(|part| part == "Поворот точки".as_bytes()));
+        assert!(bytes
+            .windows("Температурное".len())
+            .any(|part| part == "Температурное".as_bytes()));
+        assert!(bytes
+            .windows("ИТОГО".len())
+            .any(|part| part == "ИТОГО".as_bytes()));
+        assert!(bytes
+            .windows("kα".len())
+            .any(|part| part == "kα".as_bytes()));
+    }
+
+    #[test]
+    fn total_respects_selected_effects_and_symbolic_parameters() {
+        let force = CalculationResult {
+            contributions: Vec::new(),
+            numerator: 6.0,
+            rigidity: Rigidity::Symbolic,
+        };
+        let thermal = ThermalCalculationResult {
+            contributions: Vec::new(),
+            coefficient: 2.0,
+            expansion: ThermalExpansion::Symbolic,
+        };
+        assert_eq!(
+            combined_value(
+                &force,
+                &thermal,
+                EffectsSelection {
+                    force: true,
+                    thermal: true,
+                    kinematic: false,
+                }
+            ),
+            "6 / EI + α · 2"
+        );
+        assert_eq!(
+            combined_value(
+                &force,
+                &thermal,
+                EffectsSelection {
+                    force: false,
+                    thermal: true,
+                    kinematic: false,
+                }
+            ),
+            "α · 2"
+        );
     }
 
     #[test]

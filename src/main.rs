@@ -13,8 +13,10 @@ use eframe::egui::{
     Vec2,
 };
 use mohr_frame::{
-    calculate_displacement_components, format_number, CalculationResult, Diagram, DiagramKind,
-    FiberSide, Frame, Node, Ordinate, Point, Rigidity, Rod, SegmentOrientation, StructuralModel,
+    calculate_displacement_components, calculate_thermal_displacement_components, format_number,
+    CalculationResult, Diagram, DiagramKind, EffectsSelection, FiberSide, Frame, Node, Ordinate,
+    Point, Rigidity, Rod, SegmentOrientation, StructuralModel, TemperatureLoad,
+    ThermalCalculationResult, ThermalExpansion,
 };
 use project::{
     export_for_v050, load_project, project_paths, project_root_dir, sanitize_project_name_input,
@@ -60,6 +62,10 @@ struct MohrApp {
     #[serde(default = "symbolic_rigidity")]
     rigidity: Rigidity,
     #[serde(default)]
+    thermal_expansion: ThermalExpansion,
+    #[serde(default)]
+    effects: EffectsSelection,
+    #[serde(default)]
     selected_node: usize,
     #[serde(default, alias = "selected_segment")]
     selected_rod: usize,
@@ -87,6 +93,8 @@ impl Default for MohrApp {
         Self {
             model: default_model(),
             rigidity: Rigidity::Symbolic,
+            thermal_expansion: ThermalExpansion::Symbolic,
+            effects: EffectsSelection::default(),
             selected_node: 0,
             selected_rod: 0,
             show_values: true,
@@ -141,6 +149,8 @@ impl MohrApp {
         ProjectData {
             model: self.model.clone(),
             rigidity: self.rigidity,
+            thermal_expansion: self.thermal_expansion,
+            effects: self.effects,
             show_values: self.show_values,
             view_state: self.canvas_view.clone(),
         }
@@ -166,12 +176,14 @@ impl MohrApp {
             Ok(loaded) => {
                 self.model = loaded.data.model;
                 self.rigidity = loaded.data.rigidity;
+                self.thermal_expansion = loaded.data.thermal_expansion;
+                self.effects = loaded.data.effects;
                 self.show_values = loaded.data.show_values;
                 self.canvas_view = loaded.data.view_state;
                 self.clamp_selection();
                 self.project_message = if loaded.migrated_from_legacy {
                     format!(
-                        "Открыт проект v0.5.0: {}. При сохранении будет создан новый формат.",
+                        "Открыт проект предыдущей версии: {}. При сохранении будет создан формат v0.6.0.",
                         loaded.path.display()
                     )
                 } else {
@@ -189,7 +201,12 @@ impl MohrApp {
     fn export_word_report(&mut self) {
         let result = (|| {
             self.model.validate()?;
-            let bytes = build_word_report(&self.model, self.rigidity)?;
+            let bytes = build_word_report(
+                &self.model,
+                self.rigidity,
+                self.thermal_expansion,
+                self.effects,
+            )?;
             save_word_report(&self.project_name, &bytes)
         })();
         match result {
@@ -223,6 +240,8 @@ impl MohrApp {
     fn clear_workspace(&mut self) {
         self.model = StructuralModel::default();
         self.rigidity = Rigidity::Symbolic;
+        self.thermal_expansion = ThermalExpansion::Symbolic;
+        self.effects = EffectsSelection::default();
         self.selected_node = 0;
         self.selected_rod = 0;
         self.show_values = true;
@@ -306,6 +325,15 @@ impl MohrApp {
             ui.small(
                 "Холст: колесо — масштаб рамы • ЛКМ — перемещение • Shift+колесо — высота эпюры • двойной щелчок — сброс",
             );
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Включить в итог отчёта:");
+                ui.checkbox(&mut self.effects.force, "силовое");
+                ui.checkbox(&mut self.effects.thermal, "температурное");
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut self.effects.kinematic, "кинематическое (скоро)"),
+                );
+            });
             if !self.project_message.is_empty() {
                 let color = if self.project_message_is_error {
                     Color32::LIGHT_RED
@@ -410,12 +438,18 @@ impl MohrApp {
             start_node,
             end_node,
             rigidity_factor: 1.0,
+            section_height: 0.5,
+            thermal_expansion_factor: 1.0,
+            temperature: None,
             normal_diagram: zero_diagram(),
             shear_diagram: zero_diagram(),
             load_diagram: zero_diagram(),
             unit_x_diagram: zero_diagram(),
             unit_y_diagram: zero_diagram(),
             unit_rotation_diagram: zero_diagram(),
+            unit_normal_x_diagram: zero_diagram(),
+            unit_normal_y_diagram: zero_diagram(),
+            unit_normal_rotation_diagram: zero_diagram(),
         });
         self.selected_rod = self.model.rods.len() - 1;
     }
@@ -436,7 +470,11 @@ impl MohrApp {
                 ui.heading("Узловая модель рамы");
                 ui.small("Сначала задайте точки, затем соедините их стержнями");
                 ui.separator();
-                rigidity_editor(ui, &mut self.rigidity);
+                if tab == WorkspaceTab::ThermalDisplacement {
+                    thermal_expansion_editor(ui, &mut self.thermal_expansion);
+                } else {
+                    rigidity_editor(ui, &mut self.rigidity);
+                }
                 ui.separator();
 
                 egui::ScrollArea::vertical()
@@ -450,6 +488,10 @@ impl MohrApp {
                         if tab == WorkspaceTab::ForceDisplacement {
                             ui.small(
                                 "mx и my задаются от единичных сил, mφ — от единичного положительного момента (против часовой стрелки) в выбранной точке.",
+                            );
+                        } else if tab == WorkspaceTab::ThermalDisplacement {
+                            ui.small(
+                                "t₁ относится к верхней/левой стороне, t₂ — к нижней/правой. Положительный N означает растяжение.",
                             );
                         } else {
                             ui.small("Эпюры M, N и Q сохраняются в переносимом файле проекта.");
@@ -572,6 +614,7 @@ impl MohrApp {
                             height: row_height,
                             show_values: self.show_values,
                             show_dimensions: true,
+                            show_temperatures: false,
                         },
                         &mut self.canvas_view,
                     );
@@ -584,6 +627,7 @@ impl MohrApp {
                             height: row_height,
                             show_values: self.show_values,
                             show_dimensions: false,
+                            show_temperatures: false,
                         },
                         &mut self.canvas_view,
                     );
@@ -599,6 +643,7 @@ impl MohrApp {
                             height: row_height,
                             show_values: self.show_values,
                             show_dimensions: false,
+                            show_temperatures: false,
                         },
                         &mut self.canvas_view,
                     );
@@ -611,6 +656,7 @@ impl MohrApp {
                             height: row_height,
                             show_values: self.show_values,
                             show_dimensions: false,
+                            show_temperatures: false,
                         },
                         &mut self.canvas_view,
                     );
@@ -625,6 +671,7 @@ impl MohrApp {
                         height: row_height,
                         show_values: self.show_values,
                         show_dimensions: false,
+                        show_temperatures: false,
                     },
                     &mut self.canvas_view,
                 );
@@ -645,6 +692,7 @@ impl MohrApp {
                         height: row_height,
                         show_values: self.show_values,
                         show_dimensions: false,
+                        show_temperatures: false,
                     },
                     &mut self.canvas_view,
                 );
@@ -657,6 +705,7 @@ impl MohrApp {
                         height: row_height,
                         show_values: self.show_values,
                         show_dimensions: false,
+                        show_temperatures: false,
                     },
                     &mut self.canvas_view,
                 );
@@ -672,6 +721,7 @@ impl MohrApp {
                         height: row_height,
                         show_values: self.show_values,
                         show_dimensions: false,
+                        show_temperatures: false,
                     },
                     &mut self.canvas_view,
                 );
@@ -684,9 +734,84 @@ impl MohrApp {
                         height: row_height,
                         show_values: self.show_values,
                         show_dimensions: false,
+                        show_temperatures: false,
                     },
                     &mut self.canvas_view,
                 );
+            });
+        });
+    }
+
+    fn show_thermal_panel(&mut self, root_ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            thermal_result_header(ui, &self.model, self.thermal_expansion);
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let row_height = 230.0;
+                frame_canvas(
+                    ui,
+                    &self.model,
+                    CanvasOptions {
+                        title: "Температуры сторон стержней, t′, t₀ и h",
+                        diagram: None,
+                        height: row_height,
+                        show_values: self.show_values,
+                        show_dimensions: true,
+                        show_temperatures: true,
+                    },
+                    &mut self.canvas_view,
+                );
+                ui.add_space(6.0);
+                for (left_title, left_choice, right_title, right_choice) in [
+                    (
+                        "Единичная эпюра mx для температурного изгиба",
+                        DiagramChoice::UnitX,
+                        "Единичная эпюра nx для равномерного нагрева",
+                        DiagramChoice::UnitNormalX,
+                    ),
+                    (
+                        "Единичная эпюра my для температурного изгиба",
+                        DiagramChoice::UnitY,
+                        "Единичная эпюра ny для равномерного нагрева",
+                        DiagramChoice::UnitNormalY,
+                    ),
+                    (
+                        "Единичная эпюра mφ для температурного изгиба",
+                        DiagramChoice::UnitRotation,
+                        "Единичная эпюра nφ для равномерного нагрева",
+                        DiagramChoice::UnitNormalRotation,
+                    ),
+                ] {
+                    ui.columns(2, |columns| {
+                        frame_canvas(
+                            &mut columns[0],
+                            &self.model,
+                            CanvasOptions {
+                                title: left_title,
+                                diagram: Some(left_choice),
+                                height: row_height,
+                                show_values: self.show_values,
+                                show_dimensions: false,
+                                show_temperatures: false,
+                            },
+                            &mut self.canvas_view,
+                        );
+                        frame_canvas(
+                            &mut columns[1],
+                            &self.model,
+                            CanvasOptions {
+                                title: right_title,
+                                diagram: Some(right_choice),
+                                height: row_height,
+                                show_values: self.show_values,
+                                show_dimensions: false,
+                                show_temperatures: false,
+                            },
+                            &mut self.canvas_view,
+                        );
+                    });
+                    ui.add_space(6.0);
+                }
             });
         });
     }
@@ -720,11 +845,10 @@ impl eframe::App for MohrApp {
                 self.show_left_panel(ui, WorkspaceTab::ForceDisplacement);
                 self.show_force_panel(ui);
             }
-            WorkspaceTab::ThermalDisplacement => self.show_placeholder_panel(
-                ui,
-                "Температурное перемещение",
-                "Здесь появятся температурные воздействия, коэффициенты линейного расширения и интегралы температурных деформаций.",
-            ),
+            WorkspaceTab::ThermalDisplacement => {
+                self.show_left_panel(ui, WorkspaceTab::ThermalDisplacement);
+                self.show_thermal_panel(ui);
+            }
             WorkspaceTab::KinematicDisplacement => self.show_placeholder_panel(
                 ui,
                 "Кинематическое перемещение",
@@ -857,6 +981,66 @@ fn result_header(ui: &mut egui::Ui, model: &StructuralModel, rigidity: Rigidity)
         });
 }
 
+fn thermal_result_header(ui: &mut egui::Ui, model: &StructuralModel, expansion: ThermalExpansion) {
+    egui::Frame::group(ui.style())
+        .fill(Color32::from_rgb(42, 31, 31))
+        .show(ui, |ui| {
+            match calculate_thermal_displacement_components(model, expansion) {
+                Ok(result) => {
+                    let target = &model.nodes[model.target_node].id;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.heading(format!("Температурное перемещение точки {target}:"));
+                        thermal_value_label(ui, "Δx(T)", &result.horizontal, Color32::from_rgb(255, 145, 105));
+                        ui.separator();
+                        thermal_value_label(ui, "Δy(T)", &result.vertical, Color32::from_rgb(255, 180, 105));
+                        ui.separator();
+                        thermal_value_label(ui, "φ(T)", &result.rotation, Color32::from_rgb(255, 210, 115));
+                    });
+                    ui.small(
+                        "Формула: α·Σkα·[(t₂−t₁)/h · ∫m ds + t₀ · ∫n ds]. t′ показывается модулем, знак изгиба задаёт более нагретая сторона.",
+                    );
+                    for (name, component) in [
+                        ("X", &result.horizontal),
+                        ("Y", &result.vertical),
+                        ("φ", &result.rotation),
+                    ] {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.small(format!("{name}:"));
+                            for item in &component.contributions {
+                                ui.small(format!(
+                                    "{}: {}·({} + {}) = {}{}",
+                                    item.rod_id,
+                                    format_number(item.expansion_factor),
+                                    format_number(item.bending_term),
+                                    format_number(item.axial_term),
+                                    format_number(item.coefficient),
+                                    if item.active { "" } else { " (температура выключена)" }
+                                ));
+                            }
+                        });
+                    }
+                }
+                Err(error) => {
+                    ui.colored_label(Color32::LIGHT_RED, format!("Расчёт: {error}"));
+                }
+            }
+        });
+}
+
+fn thermal_value_label(
+    ui: &mut egui::Ui,
+    symbol: &str,
+    result: &ThermalCalculationResult,
+    color: Color32,
+) {
+    ui.label(
+        RichText::new(format!("{symbol} = {}", result.formatted_displacement()))
+            .size(21.0)
+            .strong()
+            .color(color),
+    );
+}
+
 fn displacement_views(result: &CalculationResult) -> String {
     let fraction = result.formatted_displacement();
     let decimal = result.formatted_decimal_displacement();
@@ -888,6 +1072,28 @@ fn rigidity_editor(ui: &mut egui::Ui, rigidity: &mut Rigidity) {
     });
 }
 
+fn thermal_expansion_editor(ui: &mut egui::Ui, expansion: &mut ThermalExpansion) {
+    ui.strong("Коэффициент линейного расширения α");
+    let numeric = matches!(expansion, ThermalExpansion::Numeric(_));
+    ui.horizontal(|ui| {
+        if ui.radio(!numeric, "Аналитический").clicked() {
+            *expansion = ThermalExpansion::Symbolic;
+        }
+        if ui.radio(numeric, "Числом").clicked() && !numeric {
+            *expansion = ThermalExpansion::Numeric(0.000012);
+        }
+        if let ThermalExpansion::Numeric(value) = expansion {
+            ui.add(
+                DragValue::new(value)
+                    .range(1.0e-15..=1.0)
+                    .speed(0.000001)
+                    .prefix("α = ")
+                    .suffix(" 1/°C"),
+            );
+        }
+    });
+}
+
 fn rod_editor(
     ui: &mut egui::Ui,
     rod: &mut Rod,
@@ -911,16 +1117,29 @@ fn rod_editor(
             format_number(length),
             orientation
         ));
-        ui.horizontal(|ui| {
-            ui.label("Жёсткость стержня:");
-            ui.add(
-                DragValue::new(&mut rod.rigidity_factor)
-                    .range(1.0e-12..=1.0e12)
-                    .speed(0.1)
-                    .prefix("EI участка = ")
-                    .suffix(" · EI"),
-            );
-        });
+        if tab == WorkspaceTab::ThermalDisplacement {
+            ui.horizontal(|ui| {
+                ui.label("Коэффициент расширения стержня:");
+                ui.add(
+                    DragValue::new(&mut rod.thermal_expansion_factor)
+                        .range(1.0e-12..=1.0e12)
+                        .speed(0.1)
+                        .prefix("α участка = ")
+                        .suffix(" · α"),
+                );
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("Жёсткость стержня:");
+                ui.add(
+                    DragValue::new(&mut rod.rigidity_factor)
+                        .range(1.0e-12..=1.0e12)
+                        .speed(0.1)
+                        .prefix("EI участка = ")
+                        .suffix(" · EI"),
+                );
+            });
+        }
         if length <= 1.0e-9 {
             ui.colored_label(Color32::LIGHT_RED, "Начало и конец стержня совпадают");
         }
@@ -935,12 +1154,26 @@ fn rod_editor(
                 egui::CollapsingHeader::new("Эпюра продольных сил N")
                     .default_open(false)
                     .show(ui, |ui| {
-                        diagram_editor(ui, &mut rod.normal_diagram, length, (unique_id, 1));
+                        diagram_editor_named(
+                            ui,
+                            &mut rod.normal_diagram,
+                            length,
+                            (unique_id, 1),
+                            "N",
+                            true,
+                        );
                     });
                 egui::CollapsingHeader::new("Эпюра поперечных сил Q")
                     .default_open(false)
                     .show(ui, |ui| {
-                        diagram_editor(ui, &mut rod.shear_diagram, length, (unique_id, 2));
+                        diagram_editor_named(
+                            ui,
+                            &mut rod.shear_diagram,
+                            length,
+                            (unique_id, 2),
+                            "Q",
+                            false,
+                        );
                     });
             }
             WorkspaceTab::ForceDisplacement => {
@@ -961,7 +1194,78 @@ fn rod_editor(
                         diagram_editor(ui, &mut rod.unit_rotation_diagram, length, (unique_id, 5));
                     });
             }
-            WorkspaceTab::ThermalDisplacement | WorkspaceTab::KinematicDisplacement => {}
+            WorkspaceTab::ThermalDisplacement => {
+                ui.horizontal(|ui| {
+                    ui.label("Высота сечения:");
+                    ui.add(
+                        DragValue::new(&mut rod.section_height)
+                            .range(1.0e-12..=1.0e12)
+                            .speed(0.05)
+                            .prefix("h = "),
+                    );
+                });
+                let mut active = rod.temperature.is_some();
+                if ui
+                    .checkbox(&mut active, "На стержне есть температурное воздействие")
+                    .changed()
+                {
+                    rod.temperature = active.then(TemperatureLoad::default);
+                }
+                if let Some(temperature) = rod.temperature.as_mut() {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            DragValue::new(&mut temperature.upper_or_left)
+                                .speed(1.0)
+                                .prefix("t₁ (верх/лево) = ")
+                                .suffix(" °C"),
+                        );
+                        ui.add(
+                            DragValue::new(&mut temperature.lower_or_right)
+                                .speed(1.0)
+                                .prefix("t₂ (низ/право) = ")
+                                .suffix(" °C"),
+                        );
+                    });
+                    ui.small(format!(
+                        "t′ = |t₁−t₂| = {};  знаковый градиент t₂−t₁ = {};  t₀ = {}",
+                        format_number(temperature.difference()),
+                        format_number(temperature.signed_gradient()),
+                        format_number(temperature.mean())
+                    ));
+                }
+                ui.small("Единичные эпюры mx, my и mφ используются с вкладки 2.");
+                egui::CollapsingHeader::new("Единичная эпюра nx (горизонталь)")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        axial_diagram_editor(
+                            ui,
+                            &mut rod.unit_normal_x_diagram,
+                            length,
+                            (unique_id, 6),
+                        );
+                    });
+                egui::CollapsingHeader::new("Единичная эпюра ny (вертикаль)")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        axial_diagram_editor(
+                            ui,
+                            &mut rod.unit_normal_y_diagram,
+                            length,
+                            (unique_id, 7),
+                        );
+                    });
+                egui::CollapsingHeader::new("Единичная эпюра nφ (поворот)")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        axial_diagram_editor(
+                            ui,
+                            &mut rod.unit_normal_rotation_diagram,
+                            length,
+                            (unique_id, 8),
+                        );
+                    });
+            }
+            WorkspaceTab::KinematicDisplacement => {}
         }
     }
 }
@@ -989,6 +1293,26 @@ fn diagram_editor(
     length: f64,
     unique_id: (usize, usize),
 ) {
+    diagram_editor_named(ui, diagram, length, unique_id, "M", false);
+}
+
+fn axial_diagram_editor(
+    ui: &mut egui::Ui,
+    diagram: &mut Diagram,
+    length: f64,
+    unique_id: (usize, usize),
+) {
+    diagram_editor_named(ui, diagram, length, unique_id, "N", true);
+}
+
+fn diagram_editor_named(
+    ui: &mut egui::Ui,
+    diagram: &mut Diagram,
+    length: f64,
+    unique_id: (usize, usize),
+    symbol: &str,
+    axial_signs: bool,
+) {
     let previous_kind = diagram.kind;
     ComboBox::from_id_salt(("diagram_kind", unique_id))
         .selected_text(diagram.kind.to_string())
@@ -1010,12 +1334,26 @@ fn diagram_editor(
             }
         }
     }
-    ordinate_editor(ui, "Слева", &mut diagram.left, (unique_id, 0));
+    ordinate_editor_named(
+        ui,
+        "Слева",
+        &mut diagram.left,
+        (unique_id, 0),
+        symbol,
+        axial_signs,
+    );
     if diagram.kind == DiagramKind::Constant {
         diagram.right = diagram.left;
         ui.small("Справа — то же значение");
     } else {
-        ordinate_editor(ui, "Справа", &mut diagram.right, (unique_id, 1));
+        ordinate_editor_named(
+            ui,
+            "Справа",
+            &mut diagram.right,
+            (unique_id, 1),
+            symbol,
+            axial_signs,
+        );
     }
     if diagram.kind == DiagramKind::Parabolic {
         ui.horizontal(|ui| {
@@ -1027,21 +1365,27 @@ fn diagram_editor(
             );
             ui.label("выпуклость:");
             let side = diagram.q_fiber.get_or_insert(FiberSide::LowerOrRight);
-            fiber_combo(ui, side, ("q_side", unique_id));
+            if axial_signs {
+                axial_sign_combo(ui, side, ("q_side", unique_id));
+            } else {
+                fiber_combo(ui, side, ("q_side", unique_id));
+            }
         });
         ui.checkbox(&mut diagram.has_extremum, "Экстремум внутри участка");
     }
     ui.small(format!(
-        "M в середине = {}",
+        "{symbol} в середине = {}",
         format_number(diagram.midpoint_value(length))
     ));
 }
 
-fn ordinate_editor(
+fn ordinate_editor_named(
     ui: &mut egui::Ui,
     label: &str,
     ordinate: &mut Ordinate,
     unique_id: ((usize, usize), usize),
+    symbol: &str,
+    axial_signs: bool,
 ) {
     ui.horizontal(|ui| {
         ui.label(format!("{label}:"));
@@ -1049,7 +1393,7 @@ fn ordinate_editor(
             DragValue::new(&mut ordinate.magnitude)
                 .range(0.0..=1.0e30)
                 .speed(0.1)
-                .prefix("|M| = "),
+                .prefix(format!("|{symbol}| = ")),
         );
         if ordinate.magnitude <= f64::EPSILON {
             ordinate.magnitude = 0.0;
@@ -1059,9 +1403,31 @@ fn ordinate_editor(
             if ordinate.fiber == FiberSide::OnAxis {
                 ordinate.fiber = FiberSide::LowerOrRight;
             }
-            fiber_combo(ui, &mut ordinate.fiber, ("ordinate_side", unique_id));
+            if axial_signs {
+                axial_sign_combo(ui, &mut ordinate.fiber, ("ordinate_side", unique_id));
+            } else {
+                fiber_combo(ui, &mut ordinate.fiber, ("ordinate_side", unique_id));
+            }
         }
     });
+}
+
+fn axial_sign_combo(
+    ui: &mut egui::Ui,
+    fiber: &mut FiberSide,
+    id: impl std::hash::Hash + std::fmt::Debug,
+) {
+    let selected = match fiber {
+        FiberSide::UpperOrLeft => "сжатие (−)",
+        FiberSide::LowerOrRight => "растяжение (+)",
+        FiberSide::OnAxis => "ноль",
+    };
+    ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(fiber, FiberSide::UpperOrLeft, "сжатие (−)");
+            ui.selectable_value(fiber, FiberSide::LowerOrRight, "растяжение (+)");
+        });
 }
 
 fn fiber_combo(
@@ -1100,12 +1466,18 @@ fn default_model() -> StructuralModel {
             start_node: 0,
             end_node: 1,
             rigidity_factor: 1.0,
+            section_height: 0.5,
+            thermal_expansion_factor: 1.0,
+            temperature: None,
             normal_diagram: zero_diagram(),
             shear_diagram: zero_diagram(),
             load_diagram: zero_diagram(),
             unit_x_diagram: zero_diagram(),
             unit_y_diagram: zero_diagram(),
             unit_rotation_diagram: zero_diagram(),
+            unit_normal_x_diagram: zero_diagram(),
+            unit_normal_y_diagram: zero_diagram(),
+            unit_normal_rotation_diagram: zero_diagram(),
         }],
         target_node: 1,
     }
@@ -1125,12 +1497,18 @@ fn migrate_legacy_frame(frame: Frame) -> StructuralModel {
             start_node,
             end_node,
             rigidity_factor: segment.rigidity_factor,
+            section_height: 0.5,
+            thermal_expansion_factor: 1.0,
+            temperature: None,
             normal_diagram: zero_diagram(),
             shear_diagram: zero_diagram(),
             load_diagram: segment.load_diagram,
             unit_x_diagram: segment.unit_diagram,
             unit_y_diagram: zero_diagram(),
             unit_rotation_diagram: zero_diagram(),
+            unit_normal_x_diagram: zero_diagram(),
+            unit_normal_y_diagram: zero_diagram(),
+            unit_normal_rotation_diagram: zero_diagram(),
         });
     }
     StructuralModel {

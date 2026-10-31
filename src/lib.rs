@@ -13,6 +13,14 @@ fn default_rigidity_factor() -> f64 {
     1.0
 }
 
+fn default_section_height() -> f64 {
+    0.5
+}
+
+fn default_thermal_expansion_factor() -> f64 {
+    1.0
+}
+
 /// Точка в глобальной декартовой системе координат.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
@@ -240,6 +248,21 @@ impl Diagram {
             chord
         }
     }
+
+    /// Точная алгебраическая площадь эпюры на участке.
+    ///
+    /// Для параболы интегрируется заданная квадратичная функция, поэтому
+    /// численный метод Симпсона здесь не используется.
+    pub fn signed_area(&self, length: f64) -> f64 {
+        let chord_area = length * (self.left_value() + self.right_value()) / 2.0;
+        if self.kind == DiagramKind::Parabolic {
+            let chord_mid = (self.left_value() + self.right_value()) / 2.0;
+            let parabolic_ordinate = self.midpoint_value(length) - chord_mid;
+            chord_area + 2.0 * length * parabolic_ordinate / 3.0
+        } else {
+            chord_area
+        }
+    }
 }
 
 /// Стержень рамы и две заданные на нем эпюры.
@@ -362,6 +385,15 @@ pub struct Rod {
     /// Коэффициент жесткости стержня относительно базового EI.
     #[serde(default = "default_rigidity_factor")]
     pub rigidity_factor: f64,
+    /// Высота поперечного сечения h для температурного изгиба.
+    #[serde(default = "default_section_height")]
+    pub section_height: f64,
+    /// Коэффициент материала: α стержня = thermal_expansion_factor · α базы.
+    #[serde(default = "default_thermal_expansion_factor")]
+    pub thermal_expansion_factor: f64,
+    /// Температуры на сторонах стержня. `None` означает отсутствие воздействия.
+    #[serde(default)]
+    pub temperature: Option<TemperatureLoad>,
     /// Эпюра продольных сил N для отображения и будущего отчета.
     #[serde(default)]
     pub normal_diagram: Diagram,
@@ -376,6 +408,46 @@ pub struct Rod {
     /// Эпюра от единичного положительного момента в выбранном узле.
     #[serde(default)]
     pub unit_rotation_diagram: Diagram,
+    /// Единичные эпюры продольной силы для температурного слагаемого.
+    #[serde(default)]
+    pub unit_normal_x_diagram: Diagram,
+    #[serde(default)]
+    pub unit_normal_y_diagram: Diagram,
+    #[serde(default)]
+    pub unit_normal_rotation_diagram: Diagram,
+}
+
+/// Постоянные по длине стержня изменения температуры относительно исходного
+/// состояния. Первая сторона — верхняя для горизонтального стержня и левая
+/// для вертикального; вторая — нижняя/правая.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TemperatureLoad {
+    pub upper_or_left: f64,
+    pub lower_or_right: f64,
+}
+
+impl Default for TemperatureLoad {
+    fn default() -> Self {
+        Self {
+            upper_or_left: 0.0,
+            lower_or_right: 0.0,
+        }
+    }
+}
+
+impl TemperatureLoad {
+    pub fn difference(self) -> f64 {
+        (self.upper_or_left - self.lower_or_right).abs()
+    }
+
+    /// Знак температурного изгиба: плюс, когда горячее нижняя/правая сторона.
+    pub fn signed_gradient(self) -> f64 {
+        self.lower_or_right - self.upper_or_left
+    }
+
+    pub fn mean(self) -> f64 {
+        (self.upper_or_left + self.lower_or_right) / 2.0
+    }
 }
 
 /// Узловая модель рамы и точка, перемещения которой определяются.
@@ -444,11 +516,36 @@ impl StructuralModel {
                     rod.id
                 ));
             }
+            if !rod.section_height.is_finite() || rod.section_height <= 0.0 {
+                return Err(format!(
+                    "стержень {}: высота сечения h должна быть положительным конечным числом",
+                    rod.id
+                ));
+            }
+            if !rod.thermal_expansion_factor.is_finite() || rod.thermal_expansion_factor <= 0.0 {
+                return Err(format!(
+                    "стержень {}: коэффициент α должен быть положительным конечным числом",
+                    rod.id
+                ));
+            }
+            if let Some(temperature) = rod.temperature {
+                if !temperature.upper_or_left.is_finite() || !temperature.lower_or_right.is_finite()
+                {
+                    return Err(format!(
+                        "стержень {}: температуры должны быть конечными числами",
+                        rod.id
+                    ));
+                }
+            }
             rod.load_diagram.validate()?;
             rod.normal_diagram.validate()?;
             rod.shear_diagram.validate()?;
             rod.unit_x_diagram.validate()?;
             rod.unit_y_diagram.validate()?;
+            rod.unit_rotation_diagram.validate()?;
+            rod.unit_normal_x_diagram.validate()?;
+            rod.unit_normal_y_diagram.validate()?;
+            rod.unit_normal_rotation_diagram.validate()?;
         }
         Ok(())
     }
@@ -524,6 +621,48 @@ pub enum Rigidity {
     Symbolic,
 }
 
+/// Коэффициент линейного температурного расширения α.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum ThermalExpansion {
+    Numeric(f64),
+    #[default]
+    Symbolic,
+}
+
+impl ThermalExpansion {
+    pub fn numeric(value: f64) -> Result<Self, String> {
+        if !value.is_finite() || value <= 0.0 {
+            return Err("α должна быть положительным конечным числом".into());
+        }
+        Ok(Self::Numeric(value))
+    }
+}
+
+/// Какие воздействия входят в итоговое перемещение и отчёт.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectsSelection {
+    #[serde(default = "default_true")]
+    pub force: bool,
+    #[serde(default)]
+    pub thermal: bool,
+    #[serde(default)]
+    pub kinematic: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for EffectsSelection {
+    fn default() -> Self {
+        Self {
+            force: true,
+            thermal: false,
+            kinematic: false,
+        }
+    }
+}
+
 impl Rigidity {
     pub fn numeric(value: f64) -> Result<Self, String> {
         if !value.is_finite() || value <= 0.0 {
@@ -578,6 +717,58 @@ pub struct DisplacementComponents {
     pub horizontal: CalculationResult,
     pub vertical: CalculationResult,
     pub rotation: CalculationResult,
+}
+
+/// Вклад одного стержня в температурное перемещение до умножения на α.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThermalRodContribution {
+    pub rod_id: String,
+    pub active: bool,
+    pub length: f64,
+    pub section_height: f64,
+    pub expansion_factor: f64,
+    pub upper_or_left: f64,
+    pub lower_or_right: f64,
+    pub temperature_difference: f64,
+    pub signed_gradient: f64,
+    pub mean_temperature: f64,
+    pub unit_moment_area: f64,
+    pub unit_normal_area: f64,
+    pub bending_term: f64,
+    pub axial_term: f64,
+    pub coefficient: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThermalCalculationResult {
+    pub contributions: Vec<ThermalRodContribution>,
+    /// Коэффициент при α либо величина до умножения на числовое α.
+    pub coefficient: f64,
+    pub expansion: ThermalExpansion,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThermalDisplacementComponents {
+    pub horizontal: ThermalCalculationResult,
+    pub vertical: ThermalCalculationResult,
+    pub rotation: ThermalCalculationResult,
+}
+
+impl ThermalCalculationResult {
+    pub fn numeric_displacement(&self) -> Option<f64> {
+        match self.expansion {
+            ThermalExpansion::Numeric(alpha) => Some(alpha * self.coefficient),
+            ThermalExpansion::Symbolic => None,
+        }
+    }
+
+    pub fn formatted_displacement(&self) -> String {
+        match self.numeric_displacement() {
+            Some(value) => format_number(value),
+            None if self.coefficient.abs() <= EPS => "0".into(),
+            None => format!("α · {}", format_number(self.coefficient)),
+        }
+    }
 }
 
 impl CalculationResult {
@@ -690,6 +881,85 @@ pub fn calculate_displacement_components(
         horizontal: calculate_displacement(&horizontal_frame, rigidity)?,
         vertical: calculate_displacement(&vertical_frame, rigidity)?,
         rotation: calculate_displacement(&rotation_frame, rigidity)?,
+    })
+}
+
+/// Вычисляет температурные составляющие перемещения по формуле
+/// α·Σkα·[∫(t′/h)·m ds + ∫t₀·n ds]. Температура постоянна по длине стержня,
+/// поэтому требуются точные площади единичных эпюр m и n.
+pub fn calculate_thermal_displacement_components(
+    model: &StructuralModel,
+    expansion: ThermalExpansion,
+) -> Result<ThermalDisplacementComponents, String> {
+    model.validate()?;
+    if let ThermalExpansion::Numeric(value) = expansion {
+        ThermalExpansion::numeric(value)?;
+    }
+    Ok(ThermalDisplacementComponents {
+        horizontal: calculate_thermal_direction(
+            model,
+            expansion,
+            DisplacementDirection::Horizontal,
+        )?,
+        vertical: calculate_thermal_direction(model, expansion, DisplacementDirection::Vertical)?,
+        rotation: calculate_thermal_direction(model, expansion, DisplacementDirection::Rotation)?,
+    })
+}
+
+fn calculate_thermal_direction(
+    model: &StructuralModel,
+    expansion: ThermalExpansion,
+    direction: DisplacementDirection,
+) -> Result<ThermalCalculationResult, String> {
+    let mut contributions = Vec::with_capacity(model.rods.len());
+    for rod in &model.rods {
+        let length = model.rod_length(rod)?;
+        let moment = match direction {
+            DisplacementDirection::Horizontal => &rod.unit_x_diagram,
+            DisplacementDirection::Vertical => &rod.unit_y_diagram,
+            DisplacementDirection::Rotation => &rod.unit_rotation_diagram,
+        };
+        let normal = match direction {
+            DisplacementDirection::Horizontal => &rod.unit_normal_x_diagram,
+            DisplacementDirection::Vertical => &rod.unit_normal_y_diagram,
+            DisplacementDirection::Rotation => &rod.unit_normal_rotation_diagram,
+        };
+        let active = rod.temperature.is_some();
+        let temperature = rod.temperature.unwrap_or_default();
+        let difference = temperature.difference();
+        let signed_gradient = temperature.signed_gradient();
+        let mean = temperature.mean();
+        let moment_area = moment.signed_area(length);
+        let normal_area = normal.signed_area(length);
+        let bending_term = if active {
+            signed_gradient / rod.section_height * moment_area
+        } else {
+            0.0
+        };
+        let axial_term = if active { mean * normal_area } else { 0.0 };
+        contributions.push(ThermalRodContribution {
+            rod_id: rod.id.clone(),
+            active,
+            length,
+            section_height: rod.section_height,
+            expansion_factor: rod.thermal_expansion_factor,
+            upper_or_left: temperature.upper_or_left,
+            lower_or_right: temperature.lower_or_right,
+            temperature_difference: difference,
+            signed_gradient,
+            mean_temperature: mean,
+            unit_moment_area: moment_area,
+            unit_normal_area: normal_area,
+            bending_term,
+            axial_term,
+            coefficient: rod.thermal_expansion_factor * (bending_term + axial_term),
+        });
+    }
+    let coefficient = contributions.iter().map(|item| item.coefficient).sum();
+    Ok(ThermalCalculationResult {
+        contributions,
+        coefficient,
+        expansion,
     })
 }
 
@@ -907,12 +1177,18 @@ mod tests {
                 start_node: 0,
                 end_node: 1,
                 rigidity_factor: 1.0,
+                section_height: 0.5,
+                thermal_expansion_factor: 1.0,
+                temperature: None,
                 normal_diagram: Diagram::default(),
                 shear_diagram: Diagram::default(),
                 load_diagram: linear(2.0, 2.0),
                 unit_x_diagram: linear(3.0, 3.0),
                 unit_y_diagram: linear(-1.0, -1.0),
                 unit_rotation_diagram: linear(0.5, 0.5),
+                unit_normal_x_diagram: Diagram::default(),
+                unit_normal_y_diagram: Diagram::default(),
+                unit_normal_rotation_diagram: Diagram::default(),
             }],
             target_node: 1,
         };
@@ -941,5 +1217,70 @@ mod tests {
         assert!((result.contributions[1].integral - 6.0).abs() < EPS);
         assert!((result.numerator - 18.0).abs() < EPS);
         assert_eq!(result.formatted_displacement(), "18 / EI");
+    }
+
+    #[test]
+    fn parabolic_area_is_integrated_analytically() {
+        let diagram = Diagram::new(
+            DiagramKind::Parabolic,
+            Ordinate::from_signed(0.0).unwrap(),
+            Ordinate::from_signed(0.0).unwrap(),
+            Some(8.0),
+            Some(FiberSide::LowerOrRight),
+            true,
+        )
+        .unwrap();
+        assert!((diagram.signed_area(2.0) - 16.0 / 3.0).abs() < EPS);
+    }
+
+    #[test]
+    fn thermal_displacement_contains_bending_and_axial_terms() {
+        let mut model = StructuralModel {
+            nodes: vec![
+                Node {
+                    id: "A".into(),
+                    position: Point { x: 0.0, y: 0.0 },
+                },
+                Node {
+                    id: "B".into(),
+                    position: Point { x: 2.0, y: 0.0 },
+                },
+            ],
+            rods: vec![Rod {
+                id: "AB".into(),
+                start_node: 0,
+                end_node: 1,
+                rigidity_factor: 1.0,
+                section_height: 0.5,
+                thermal_expansion_factor: 2.0,
+                temperature: Some(TemperatureLoad {
+                    upper_or_left: 10.0,
+                    lower_or_right: 30.0,
+                }),
+                normal_diagram: Diagram::default(),
+                shear_diagram: Diagram::default(),
+                load_diagram: Diagram::default(),
+                unit_x_diagram: linear(2.0, 2.0),
+                unit_y_diagram: Diagram::default(),
+                unit_rotation_diagram: Diagram::default(),
+                unit_normal_x_diagram: linear(3.0, 3.0),
+                unit_normal_y_diagram: Diagram::default(),
+                unit_normal_rotation_diagram: Diagram::default(),
+            }],
+            target_node: 1,
+        };
+        let result =
+            calculate_thermal_displacement_components(&model, ThermalExpansion::Symbolic).unwrap();
+        assert!((result.horizontal.contributions[0].bending_term - 160.0).abs() < EPS);
+        assert!((result.horizontal.contributions[0].axial_term - 120.0).abs() < EPS);
+        assert!((result.horizontal.coefficient - 560.0).abs() < EPS);
+        assert_eq!(result.horizontal.formatted_displacement(), "α · 560");
+
+        model.rods[0].temperature = None;
+        let disabled =
+            calculate_thermal_displacement_components(&model, ThermalExpansion::Numeric(0.000012))
+                .unwrap();
+        assert!(disabled.horizontal.coefficient.abs() < EPS);
+        assert_eq!(disabled.horizontal.formatted_displacement(), "0");
     }
 }
