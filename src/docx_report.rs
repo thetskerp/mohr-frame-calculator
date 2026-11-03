@@ -9,9 +9,9 @@ use std::io::Cursor;
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use mohr_frame::{
     calculate_displacement_components, calculate_thermal_displacement_components, format_number,
-    CalculationResult, Diagram, DisplacementComponents, EffectsSelection, IntegrationMethod,
-    Rigidity, StructuralModel, ThermalCalculationResult, ThermalDisplacementComponents,
-    ThermalExpansion,
+    CalculationResult, Diagram, DisplacementComponents, EffectsSelection, FiberSide,
+    IntegrationMethod, Rigidity, StructuralModel, ThermalCalculationResult,
+    ThermalDisplacementComponents, ThermalExpansion,
 };
 
 const REPORT_IMAGE_WIDTH: u32 = 1000;
@@ -87,7 +87,7 @@ fn build_document_xml(
     ));
     body.push_str(&paragraph(
         &format!(
-            "Базовый коэффициент температурного расширения: {}. Для стержня αᵢ = kα·α. Температурное слагаемое: α·Σkα·[(t₂−t₁)/h·∫m ds + t₀·∫n ds].",
+            "Базовый коэффициент температурного расширения: {}. Для стержня αᵢ = kα·α. Температурное слагаемое: α·Σkα·[sₜ·t′/h·∫m ds + t₀·∫n ds], где t′ = |t₁−t₂|, а sₜ — знак стороны наиболее нагретых волокон.",
             xml_escape(&expansion_text(expansion))
         ),
         None,
@@ -203,12 +203,14 @@ fn build_document_xml(
 
     body.push_str(page_break());
     body.push_str(&heading("Расчёт температурных перемещений", 1));
-    body.push_str(&math_paragraph("ΔT = α·Σ kα·[(t₂−t₁)·∫m ds/h + t₀·∫n ds]"));
+    body.push_str(&math_paragraph(
+        "ΔT = α·Σ kα·[sₜ·t′·∫m ds/h + t₀·∫n ds],  t′=|t₁−t₂|",
+    ));
     body.push_str(&paragraph(
         if effects.thermal {
-            "Температурное воздействие включено в итог. t′ = |t₁−t₂| приводится в исходных данных; знак изгиба определяется выражением t₂−t₁."
+            "Температурное воздействие включено в итог. t′ всегда берётся по модулю; знак изгиба определяется стороной наиболее нагретых волокон."
         } else {
-            "Температурное воздействие рассчитано, но не включено в итог. t′ = |t₁−t₂| приводится в исходных данных; знак изгиба определяется выражением t₂−t₁."
+            "Температурное воздействие рассчитано, но не включено в итог. t′ всегда берётся по модулю; знак изгиба определяется стороной наиболее нагретых волокон."
         },
         None,
         false,
@@ -425,20 +427,22 @@ fn append_thermal_component(
     ));
     for item in &result.contributions {
         body.push_str(&calculation_paragraph(&format!(
-            "Стержень {}: t′=|{}−{}|={}; t₂−t₁={}; t₀=({}+{})/2={}",
+            "Стержень {}: t′=|{}−{}|={}; наиболее нагретая сторона={}; sₜ={}; t₀=({}+{})/2={}",
             item.rod_id,
             format_number(item.upper_or_left),
             format_number(item.lower_or_right),
             format_number(item.temperature_difference),
-            format_number(item.signed_gradient),
+            hotter_side_text(item.hotter_side),
+            format_number(item.hotter_side_sign),
             format_number(item.upper_or_left),
             format_number(item.lower_or_right),
             format_number(item.mean_temperature),
         )));
         body.push_str(&calculation_paragraph(&format!(
-            "α·{}·[({}/{})·{} + {}·{}] = α·{}·[{} + {}] = α·{}{}",
+            "α·{}·[{}·{}/{}·{} + {}·{}] = α·{}·[{} + {}] = α·{}{}",
             format_number(item.expansion_factor),
-            format_number(item.signed_gradient),
+            format_number(item.hotter_side_sign),
+            format_number(item.temperature_difference),
             format_number(item.section_height),
             format_number(item.unit_moment_area),
             format_number(item.mean_temperature),
@@ -571,6 +575,14 @@ fn expansion_text(expansion: ThermalExpansion) -> String {
         ThermalExpansion::Numeric(value) => {
             format!("α = {} 1/°C", format_number(value))
         }
+    }
+}
+
+fn hotter_side_text(side: Option<FiberSide>) -> &'static str {
+    match side {
+        Some(FiberSide::UpperOrLeft) => "верх/лево",
+        Some(FiberSide::LowerOrRight) => "низ/право",
+        Some(FiberSide::OnAxis) | None => "нет (t₁=t₂)",
     }
 }
 
@@ -734,7 +746,7 @@ fn core_properties_xml() -> &'static str {
 }
 
 fn app_properties_xml() -> &'static str {
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.6.0</AppVersion></Properties>"#
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.6.1</AppVersion></Properties>"#
 }
 
 fn styles_xml() -> &'static str {

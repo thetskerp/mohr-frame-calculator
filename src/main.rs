@@ -4,7 +4,7 @@ mod canvas;
 mod docx_report;
 mod project;
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use canvas::{frame_canvas, CanvasOptions, CanvasViewState, DiagramChoice, GOST_FONT_FAMILY};
 use docx_report::build_word_report;
@@ -19,9 +19,11 @@ use mohr_frame::{
     ThermalCalculationResult, ThermalExpansion,
 };
 use project::{
-    export_for_v050, load_project, project_paths, project_root_dir, sanitize_project_name_input,
-    save_project, save_word_report, ProjectData,
+    export_for_v050, export_for_v050_for_path, load_project_from_path, project_name_from_path,
+    project_paths, project_paths_from_scheme, project_root_dir, sanitize_project_name_input,
+    save_project, save_project_to_path, save_word_report, save_word_report_for_path, ProjectData,
 };
+use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 
 const APP_KEY: &str = "mohr-frame-gui";
@@ -77,6 +79,10 @@ struct MohrApp {
     active_tab: WorkspaceTab,
     #[serde(default = "default_project_name", alias = "project_filename")]
     project_name: String,
+    /// Точный путь открытого/сохранённого проекта. В файл схемы не входит,
+    /// но сохраняется в локальном состоянии приложения.
+    #[serde(default)]
+    project_path: Option<PathBuf>,
     #[serde(skip)]
     project_message: String,
     #[serde(skip)]
@@ -101,6 +107,7 @@ impl Default for MohrApp {
             canvas_view: CanvasViewState::default(),
             active_tab: WorkspaceTab::Diagrams,
             project_name: default_project_name(),
+            project_path: None,
             project_message: String::new(),
             project_message_is_error: false,
             confirm_clear: false,
@@ -157,9 +164,17 @@ impl MohrApp {
     }
 
     fn save_project_file(&mut self) {
-        let result = save_project(&self.project_name, &self.project_data());
+        let data = self.project_data();
+        let result = match self.project_path.as_deref() {
+            Some(path) => save_project_to_path(path, &data),
+            None => save_project(&self.project_name, &data),
+        };
         match result {
             Ok(path) => {
+                if let Ok(name) = project_name_from_path(&path) {
+                    self.project_name = name;
+                }
+                self.project_path = Some(path.clone());
                 self.project_message = format!("Сохранено: {}", path.display());
                 self.project_message_is_error = false;
             }
@@ -171,9 +186,26 @@ impl MohrApp {
     }
 
     fn open_project_file(&mut self) {
-        let result = load_project(&self.project_name);
+        let initial_directory = self
+            .project_path
+            .as_deref()
+            .and_then(|path| path.parent())
+            .map_or_else(project_root_dir, PathBuf::from);
+        let selected = FileDialog::new()
+            .set_title("Открыть проект Mohr Frame")
+            .set_directory(initial_directory)
+            .add_filter("Проект Mohr Frame", &["ron"])
+            .pick_file();
+        let Some(path) = selected else {
+            return;
+        };
+        let result = load_project_from_path(&path);
         match result {
             Ok(loaded) => {
+                if let Ok(name) = project_name_from_path(&loaded.path) {
+                    self.project_name = name;
+                }
+                self.project_path = Some(loaded.path.clone());
                 self.model = loaded.data.model;
                 self.rigidity = loaded.data.rigidity;
                 self.thermal_expansion = loaded.data.thermal_expansion;
@@ -183,8 +215,9 @@ impl MohrApp {
                 self.clamp_selection();
                 self.project_message = if loaded.migrated_from_legacy {
                     format!(
-                        "Открыт проект предыдущей версии: {}. При сохранении будет создан формат v0.6.0.",
-                        loaded.path.display()
+                        "Открыт проект предыдущей версии: {}. При сохранении будет создан формат v{}.",
+                        loaded.path.display(),
+                        env!("CARGO_PKG_VERSION")
                     )
                 } else {
                     format!("Открыто: {}", loaded.path.display())
@@ -207,7 +240,10 @@ impl MohrApp {
                 self.thermal_expansion,
                 self.effects,
             )?;
-            save_word_report(&self.project_name, &bytes)
+            match self.project_path.as_deref() {
+                Some(path) => save_word_report_for_path(path, &bytes),
+                None => save_word_report(&self.project_name, &bytes),
+            }
         })();
         match result {
             Ok(path) => {
@@ -222,7 +258,12 @@ impl MohrApp {
     }
 
     fn export_legacy_project(&mut self) {
-        match export_for_v050(&self.project_name, &self.project_data()) {
+        let data = self.project_data();
+        let result = match self.project_path.as_deref() {
+            Some(path) => export_for_v050_for_path(path, &data),
+            None => export_for_v050(&self.project_name, &data),
+        };
+        match result {
             Ok(path) => {
                 self.project_message = format!(
                     "Совместимая копия v0.5.0 сохранена: {}. Эпюра mφ, поворот и вид холста в неё не входят.",
@@ -286,12 +327,19 @@ impl MohrApp {
                 );
                 if name_response.changed() {
                     self.project_name = sanitize_project_name_input(&self.project_name);
+                    // Изменение имени означает создание нового проекта. Открытый
+                    // ранее путь больше не должен быть перезаписан автоматически.
+                    self.project_path = None;
                 }
                 ui.monospace(".mohr.ron");
                 if ui.button("Сохранить").clicked() {
                     self.save_project_file();
                 }
-                if ui.button("Открыть").clicked() {
+                if ui
+                    .button("Открыть…")
+                    .on_hover_text("Выбрать файл проекта *.mohr.ron в Finder или Проводнике")
+                    .clicked()
+                {
                     self.open_project_file();
                 }
                 if ui.button("Экспорт Word").clicked() {
@@ -317,9 +365,17 @@ impl MohrApp {
                 {
                     self.confirm_clear = true;
                 }
-                let folder = project_paths(&self.project_name)
+                let folder = self
+                    .project_path
+                    .as_deref()
+                    .and_then(|path| project_paths_from_scheme(path).ok())
                     .map(|paths| paths.directory)
-                    .unwrap_or_else(|_| project_root_dir());
+                    .or_else(|| {
+                        project_paths(&self.project_name)
+                            .ok()
+                            .map(|paths| paths.directory)
+                    })
+                    .unwrap_or_else(project_root_dir);
                 ui.small(format!("Папка проекта: {}", folder.display()));
             });
             ui.small(
@@ -997,7 +1053,7 @@ fn thermal_result_header(ui: &mut egui::Ui, model: &StructuralModel, expansion: 
                         thermal_value_label(ui, "φ(T)", &result.rotation, Color32::from_rgb(255, 210, 115));
                     });
                     ui.small(
-                        "Формула: α·Σkα·[(t₂−t₁)/h · ∫m ds + t₀ · ∫n ds]. t′ показывается модулем, знак изгиба задаёт более нагретая сторона.",
+                        "Формула: α·Σkα·[sₜ·t′/h · ∫m ds + t₀ · ∫n ds], где t′ = |t₁−t₂|, а sₜ — знак стороны наиболее нагретых волокон.",
                     );
                     for (name, component) in [
                         ("X", &result.horizontal),
@@ -1226,10 +1282,16 @@ fn rod_editor(
                                 .suffix(" °C"),
                         );
                     });
+                    let hotter_side = match temperature.hotter_side() {
+                        Some(FiberSide::UpperOrLeft) => "верх/лево",
+                        Some(FiberSide::LowerOrRight) => "низ/право",
+                        Some(FiberSide::OnAxis) | None => "нет — температуры равны",
+                    };
                     ui.small(format!(
-                        "t′ = |t₁−t₂| = {};  знаковый градиент t₂−t₁ = {};  t₀ = {}",
+                        "t′ = |t₁−t₂| = {};  наиболее нагретая сторона: {};  sₜ = {};  t₀ = {}",
                         format_number(temperature.difference()),
-                        format_number(temperature.signed_gradient()),
+                        hotter_side,
+                        format_number(temperature.hotter_side_sign()),
                         format_number(temperature.mean())
                     ));
                 }

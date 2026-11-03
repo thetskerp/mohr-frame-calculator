@@ -436,13 +436,27 @@ impl Default for TemperatureLoad {
 }
 
 impl TemperatureLoad {
+    /// Модуль перепада температур между сторонами сечения.
     pub fn difference(self) -> f64 {
         (self.upper_or_left - self.lower_or_right).abs()
     }
 
-    /// Знак температурного изгиба: плюс, когда горячее нижняя/правая сторона.
-    pub fn signed_gradient(self) -> f64 {
-        self.lower_or_right - self.upper_or_left
+    /// Сторона наиболее нагретых волокон. При равных температурах
+    /// температурного изгиба нет, поэтому сторона не определяется.
+    pub fn hotter_side(self) -> Option<FiberSide> {
+        if self.upper_or_left > self.lower_or_right {
+            Some(FiberSide::UpperOrLeft)
+        } else if self.lower_or_right > self.upper_or_left {
+            Some(FiberSide::LowerOrRight)
+        } else {
+            None
+        }
+    }
+
+    /// Знак стороны наиболее нагретых волокон по принятому правилу эпюр:
+    /// верх/лево = −1, низ/право = +1.
+    pub fn hotter_side_sign(self) -> f64 {
+        self.hotter_side().map_or(0.0, FiberSide::sign)
     }
 
     pub fn mean(self) -> f64 {
@@ -730,7 +744,8 @@ pub struct ThermalRodContribution {
     pub upper_or_left: f64,
     pub lower_or_right: f64,
     pub temperature_difference: f64,
-    pub signed_gradient: f64,
+    pub hotter_side: Option<FiberSide>,
+    pub hotter_side_sign: f64,
     pub mean_temperature: f64,
     pub unit_moment_area: f64,
     pub unit_normal_area: f64,
@@ -885,7 +900,8 @@ pub fn calculate_displacement_components(
 }
 
 /// Вычисляет температурные составляющие перемещения по формуле
-/// α·Σkα·[∫(t′/h)·m ds + ∫t₀·n ds]. Температура постоянна по длине стержня,
+/// α·Σkα·[sₜ·t′/h·∫m ds + t₀·∫n ds], где t′ = |t₁−t₂|, а sₜ — знак
+/// стороны наиболее нагретых волокон. Температура постоянна по длине стержня,
 /// поэтому требуются точные площади единичных эпюр m и n.
 pub fn calculate_thermal_displacement_components(
     model: &StructuralModel,
@@ -927,12 +943,13 @@ fn calculate_thermal_direction(
         let active = rod.temperature.is_some();
         let temperature = rod.temperature.unwrap_or_default();
         let difference = temperature.difference();
-        let signed_gradient = temperature.signed_gradient();
+        let hotter_side = temperature.hotter_side();
+        let hotter_side_sign = temperature.hotter_side_sign();
         let mean = temperature.mean();
         let moment_area = moment.signed_area(length);
         let normal_area = normal.signed_area(length);
         let bending_term = if active {
-            signed_gradient / rod.section_height * moment_area
+            hotter_side_sign * difference / rod.section_height * moment_area
         } else {
             0.0
         };
@@ -946,7 +963,8 @@ fn calculate_thermal_direction(
             upper_or_left: temperature.upper_or_left,
             lower_or_right: temperature.lower_or_right,
             temperature_difference: difference,
-            signed_gradient,
+            hotter_side,
+            hotter_side_sign,
             mean_temperature: mean,
             unit_moment_area: moment_area,
             unit_normal_area: normal_area,
@@ -1095,6 +1113,20 @@ mod tests {
             result.contributions[0].method,
             IntegrationMethod::TrapezoidalProduct
         );
+    }
+
+    #[test]
+    fn force_sign_is_positive_on_same_side_and_negative_on_opposite_sides() {
+        let same_side = Frame {
+            segments: vec![segment(linear(-2.0, -2.0), linear(-3.0, -3.0))],
+        };
+        let opposite_sides = Frame {
+            segments: vec![segment(linear(-2.0, -2.0), linear(3.0, 3.0))],
+        };
+        let positive = calculate_displacement(&same_side, Rigidity::Symbolic).unwrap();
+        let negative = calculate_displacement(&opposite_sides, Rigidity::Symbolic).unwrap();
+        assert!((positive.numerator - 12.0).abs() < EPS);
+        assert!((negative.numerator + 12.0).abs() < EPS);
     }
 
     #[test]
@@ -1275,6 +1307,43 @@ mod tests {
         assert!((result.horizontal.contributions[0].axial_term - 120.0).abs() < EPS);
         assert!((result.horizontal.coefficient - 560.0).abs() < EPS);
         assert_eq!(result.horizontal.formatted_displacement(), "α · 560");
+        assert_eq!(
+            result.horizontal.contributions[0].temperature_difference,
+            20.0
+        );
+        assert_eq!(
+            result.horizontal.contributions[0].hotter_side,
+            Some(FiberSide::LowerOrRight)
+        );
+
+        // Нижняя/правая сторона горячее: эпюра с противоположной стороны даёт минус.
+        model.rods[0].unit_x_diagram = linear(-2.0, -2.0);
+        let opposite =
+            calculate_thermal_displacement_components(&model, ThermalExpansion::Symbolic).unwrap();
+        assert!((opposite.horizontal.contributions[0].bending_term + 160.0).abs() < EPS);
+
+        // Верхняя/левая сторона горячее: эпюра на этой же стороне снова даёт плюс.
+        model.rods[0].temperature = Some(TemperatureLoad {
+            upper_or_left: 30.0,
+            lower_or_right: 10.0,
+        });
+        let upper_same =
+            calculate_thermal_displacement_components(&model, ThermalExpansion::Symbolic).unwrap();
+        assert!((upper_same.horizontal.contributions[0].bending_term - 160.0).abs() < EPS);
+        assert_eq!(
+            upper_same.horizontal.contributions[0].temperature_difference,
+            20.0
+        );
+        assert_eq!(
+            upper_same.horizontal.contributions[0].hotter_side,
+            Some(FiberSide::UpperOrLeft)
+        );
+
+        // При горячей верхней/левой стороне эпюра снизу/справа даёт минус.
+        model.rods[0].unit_x_diagram = linear(2.0, 2.0);
+        let upper_opposite =
+            calculate_thermal_displacement_components(&model, ThermalExpansion::Symbolic).unwrap();
+        assert!((upper_opposite.horizontal.contributions[0].bending_term + 160.0).abs() < EPS);
 
         model.rods[0].temperature = None;
         let disabled =

@@ -69,8 +69,19 @@ pub struct ProjectPaths {
 }
 
 pub fn save_project(project_name: &str, data: &ProjectData) -> Result<PathBuf, String> {
-    data.model.validate()?;
     let paths = project_paths(project_name)?;
+    save_project_with_paths(&paths, data)
+}
+
+/// Сохраняет проект обратно в файл, выбранный пользователем. Родительская
+/// папка выбранного `*.mohr.ron` считается папкой проекта.
+pub fn save_project_to_path(path: &Path, data: &ProjectData) -> Result<PathBuf, String> {
+    let paths = project_paths_from_scheme(path)?;
+    save_project_with_paths(&paths, data)
+}
+
+fn save_project_with_paths(paths: &ProjectPaths, data: &ProjectData) -> Result<PathBuf, String> {
+    data.model.validate()?;
     fs::create_dir_all(&paths.directory).map_err(|error| {
         format!(
             "не удалось создать папку проекта {}: {error}",
@@ -101,35 +112,34 @@ pub fn save_project(project_name: &str, data: &ProjectData) -> Result<PathBuf, S
         })?;
     }
     atomic_write(&paths.scheme, text.as_bytes())?;
-    Ok(paths.scheme)
+    Ok(paths.scheme.clone())
 }
 
-pub fn load_project(project_name: &str) -> Result<LoadedProject, String> {
-    let paths = project_paths(project_name)?;
-    // v0.5.0 хранил файл прямо в корне. После открытия обычное
-    // сохранение перенесёт его в обособленную папку нового формата.
-    let path = if paths.scheme.is_file() {
-        paths.scheme
-    } else {
-        let legacy = legacy_project_path(project_name)?;
-        if legacy.is_file() {
-            legacy
-        } else {
-            paths.scheme
-        }
-    };
-    let text = fs::read_to_string(&path)
+/// Открывает непосредственно выбранный файл проекта независимо от того,
+/// где он находится на диске.
+pub fn load_project_from_path(path: &Path) -> Result<LoadedProject, String> {
+    project_paths_from_scheme(path)?;
+    let text = fs::read_to_string(path)
         .map_err(|error| format!("не удалось открыть {}: {error}", path.display()))?;
     let (data, migrated_from_legacy) = deserialize_project_text(&text)?;
     Ok(LoadedProject {
         data,
-        path,
+        path: path.to_path_buf(),
         migrated_from_legacy,
     })
 }
 
 pub fn save_word_report(project_name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     let paths = project_paths(project_name)?;
+    save_word_report_with_paths(&paths, bytes)
+}
+
+pub fn save_word_report_for_path(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let paths = project_paths_from_scheme(path)?;
+    save_word_report_with_paths(&paths, bytes)
+}
+
+fn save_word_report_with_paths(paths: &ProjectPaths, bytes: &[u8]) -> Result<PathBuf, String> {
     fs::create_dir_all(&paths.directory).map_err(|error| {
         format!(
             "не удалось создать папку проекта {}: {error}",
@@ -137,14 +147,23 @@ pub fn save_word_report(project_name: &str, bytes: &[u8]) -> Result<PathBuf, Str
         )
     })?;
     atomic_write(&paths.report, bytes)?;
-    Ok(paths.report)
+    Ok(paths.report.clone())
 }
 
 /// Явный экспорт в старый формат. Поворот и состояние камеры
 /// сознательно опускаются, чтобы v0.5.0 гарантированно прочитала файл.
 pub fn export_for_v050(project_name: &str, data: &ProjectData) -> Result<PathBuf, String> {
-    data.model.validate()?;
     let paths = project_paths(project_name)?;
+    export_for_v050_with_paths(&paths, data)
+}
+
+pub fn export_for_v050_for_path(path: &Path, data: &ProjectData) -> Result<PathBuf, String> {
+    let paths = project_paths_from_scheme(path)?;
+    export_for_v050_with_paths(&paths, data)
+}
+
+fn export_for_v050_with_paths(paths: &ProjectPaths, data: &ProjectData) -> Result<PathBuf, String> {
+    data.model.validate()?;
     fs::create_dir_all(&paths.directory).map_err(|error| {
         format!(
             "не удалось создать папку проекта {}: {error}",
@@ -164,7 +183,7 @@ pub fn export_for_v050(project_name: &str, data: &ProjectData) -> Result<PathBuf
     let text = ron::ser::to_string_pretty(&legacy, ron::ser::PrettyConfig::default())
         .map_err(|error| format!("не удалось подготовить совместимую копию: {error}"))?;
     atomic_write(&paths.legacy_export, text.as_bytes())?;
-    Ok(paths.legacy_export)
+    Ok(paths.legacy_export.clone())
 }
 
 pub(crate) fn deserialize_project_text(text: &str) -> Result<(ProjectData, bool), String> {
@@ -334,9 +353,40 @@ pub fn project_paths(project_name: &str) -> Result<ProjectPaths, String> {
     })
 }
 
-fn legacy_project_path(project_name: &str) -> Result<PathBuf, String> {
-    let name = validated_project_name(project_name)?;
-    Ok(project_root_dir().join(format!("{name}.mohr.ron")))
+/// Формирует все пути проекта относительно папки выбранного файла схемы.
+/// В отличие от нового проекта дополнительная вложенная папка не создаётся:
+/// папкой проекта считается уже существующий родитель `*.mohr.ron`.
+pub fn project_paths_from_scheme(path: &Path) -> Result<ProjectPaths, String> {
+    let name = project_name_from_path(path)?;
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    Ok(ProjectPaths {
+        scheme: path.to_path_buf(),
+        report: directory.join(format!("{name}-report.docx")),
+        legacy_export: directory.join(format!("{name}-for-v0.5.0.mohr.ron")),
+        backup: directory
+            .join("backups")
+            .join(format!("{name}-previous.mohr.ron")),
+        directory,
+    })
+}
+
+pub fn project_name_from_path(path: &Path) -> Result<String, String> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "некорректное имя файла проекта".to_string())?;
+    let suffix = ".mohr.ron";
+    if !file_name.to_ascii_lowercase().ends_with(suffix) {
+        return Err("выберите файл проекта с расширением .mohr.ron".into());
+    }
+    let name = &file_name[..file_name.len() - suffix.len()];
+    if name.trim().is_empty() {
+        return Err("имя файла проекта не может быть пустым".into());
+    }
+    Ok(name.to_string())
 }
 
 pub fn project_root_dir() -> PathBuf {
@@ -421,6 +471,23 @@ mod tests {
         assert!(project_paths("../first_scheme").is_err());
         assert!(project_paths("CON").is_err());
         assert!(project_paths("").is_err());
+    }
+
+    #[test]
+    fn selected_scheme_parent_is_treated_as_project_directory() {
+        let scheme = PathBuf::from("transferred_project").join("first_scheme.mohr.ron");
+        let paths = project_paths_from_scheme(&scheme).unwrap();
+        assert_eq!(paths.directory, PathBuf::from("transferred_project"));
+        assert_eq!(paths.scheme, scheme);
+        assert_eq!(
+            paths.report,
+            PathBuf::from("transferred_project").join("first_scheme-report.docx")
+        );
+        assert_eq!(
+            project_name_from_path(&paths.scheme).unwrap(),
+            "first_scheme"
+        );
+        assert!(project_paths_from_scheme(Path::new("first_scheme.ron")).is_err());
     }
 
     #[test]
