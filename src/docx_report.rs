@@ -64,9 +64,21 @@ fn build_document_xml(
         Some("Title"),
         true,
     ));
+    let included_effects = [
+        effects.force.then_some("силового"),
+        effects.thermal.then_some("температурного"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let report_scope = if included_effects.is_empty() {
+        "ни одно воздействие не выбрано".to_string()
+    } else {
+        format!("расчёт {} воздействия", included_effects.join(" и "))
+    };
     body.push_str(&paragraph(
         &format!(
-            "Отчёт содержит раздельный расчёт силового и температурного воздействий для точки {}. Итоговые значения: Δx = {}; Δy = {}; φ = {}.",
+            "Отчёт содержит {report_scope} для точки {}. Итоговые значения: Δx = {}; Δy = {}; φ = {}.",
             xml_escape(target),
             xml_escape(&combined_value(horizontal, &thermal.horizontal, effects)),
             xml_escape(&combined_value(vertical, &thermal.vertical, effects)),
@@ -77,7 +89,8 @@ fn build_document_xml(
     ));
 
     body.push_str(&heading("Исходные данные", 1));
-    body.push_str(&paragraph(
+    if effects.force {
+        body.push_str(&paragraph(
         &format!(
             "Базовая изгибная жёсткость: {}. Для каждого стержня EI участка равно коэффициенту k, умноженному на базовое EI.",
             xml_escape(&rigidity_text(rigidity))
@@ -85,7 +98,9 @@ fn build_document_xml(
         None,
         false,
     ));
-    body.push_str(&paragraph(
+    }
+    if effects.thermal {
+        body.push_str(&paragraph(
         &format!(
             "Базовый коэффициент температурного расширения: {}. Для стержня αᵢ = kα·α. Температурное слагаемое: α·Σkα·[sₜ·t′/h·∫m ds + t₀·∫n ds], где t′ = |t₁−t₂|, а sₜ — знак стороны наиболее нагретых волокон.",
             xml_escape(&expansion_text(expansion))
@@ -93,6 +108,7 @@ fn build_document_xml(
         None,
         false,
     ));
+    }
 
     let node_rows = model
         .nodes
@@ -122,23 +138,30 @@ fn build_document_xml(
         let end = &model.nodes[rod.end_node].id;
         let length = model.rod_length(rod)?;
         let temperature = rod.temperature.unwrap_or_default();
-        rod_rows.push(vec![
+        let mut row = vec![
             rod.id.clone(),
             format!("{start}–{end}"),
             format_number(length),
-            format_number(rod.rigidity_factor),
-            format_number(rod.section_height),
-            format_number(rod.thermal_expansion_factor),
-            if rod.temperature.is_some() {
-                format!(
-                    "{}; {}",
-                    format_number(temperature.upper_or_left),
-                    format_number(temperature.lower_or_right)
-                )
-            } else {
-                "нет".into()
-            },
-        ]);
+        ];
+        if effects.force {
+            row.push(format_number(rod.rigidity_factor));
+        }
+        if effects.thermal {
+            row.extend([
+                format_number(rod.section_height),
+                format_number(rod.thermal_expansion_factor),
+                if rod.temperature.is_some() {
+                    format!(
+                        "{}; {}",
+                        format_number(temperature.upper_or_left),
+                        format_number(temperature.lower_or_right)
+                    )
+                } else {
+                    "нет".into()
+                },
+            ]);
+        }
+        rod_rows.push(row);
         diagram_rows.push(vec![
             rod.id.clone(),
             diagram_values(&rod.load_diagram, length),
@@ -147,10 +170,14 @@ fn build_document_xml(
         ]);
     }
     body.push_str(&caption("Таблица 2  Геометрия и параметры стержней"));
-    body.push_str(&table(
-        &["Стержень", "Узлы", "L", "kEI", "h", "kα", "t₁; t₂"],
-        &rod_rows,
-    ));
+    let mut rod_headers = vec!["Стержень", "Узлы", "L"];
+    if effects.force {
+        rod_headers.push("kEI");
+    }
+    if effects.thermal {
+        rod_headers.extend(["h", "kα", "t₁; t₂"]);
+    }
+    body.push_str(&table(&rod_headers, &rod_rows));
     body.push_str(&caption("Таблица 3  Заданные эпюры M, N и Q"));
     body.push_str(&table(
         &["Стержень", "M  L; L/2; R", "N  L; L/2; R", "Q  L; L/2; R"],
@@ -165,48 +192,51 @@ fn build_document_xml(
     body.push_str(image_paragraph());
     body.push_str(&caption("Рисунок 1  Геометрия рамы и размеры стержней"));
 
-    body.push_str(&heading("Расчёт силовых перемещений и поворота", 1));
-    body.push_str(&paragraph(
-        if effects.force {
-            "Силовое воздействие включено в итог."
-        } else {
-            "Силовое воздействие рассчитано, но не включено в итог."
-        },
-        None,
-        false,
-    ));
-    body.push_str(&math_paragraph("Δx, Δy, φ = Σ ∫ Mₚ m₁ / (EIᵢ) dx"));
-    body.push_str(empty_paragraph());
-    body.push_str(&paragraph(
+    if effects.force {
+        body.push_str(&heading("Расчёт силовых перемещений и поворота", 1));
+        body.push_str(&paragraph(
+            if effects.force {
+                "Силовое воздействие включено в итог."
+            } else {
+                "Силовое воздействие рассчитано, но не включено в итог."
+            },
+            None,
+            false,
+        ));
+        body.push_str(&math_paragraph("Δx, Δy, φ = Σ ∫ Mₚ m₁ / (EIᵢ) dx"));
+        body.push_str(empty_paragraph());
+        body.push_str(&paragraph(
         "На линейных и постоянных участках применяется аналитическое перемножение трапеций. Если хотя бы одна эпюра параболическая, используется трёхточечная формула Симпсона. Различие жёсткостей учитывается делением вклада участка на коэффициент k.",
         None,
         false,
     ));
 
-    append_component(
-        &mut body,
-        model,
-        "Горизонтальное перемещение",
-        "Δx",
-        horizontal,
-        4,
-    );
-    append_component(
-        &mut body,
-        model,
-        "Вертикальное перемещение",
-        "Δy",
-        vertical,
-        5,
-    );
-    append_component(&mut body, model, "Поворот точки", "φ", rotation, 6);
+        append_component(
+            &mut body,
+            model,
+            "Горизонтальное перемещение",
+            "Δx",
+            horizontal,
+            4,
+        );
+        append_component(
+            &mut body,
+            model,
+            "Вертикальное перемещение",
+            "Δy",
+            vertical,
+            5,
+        );
+        append_component(&mut body, model, "Поворот точки", "φ", rotation, 6);
+    }
 
-    body.push_str(page_break());
-    body.push_str(&heading("Расчёт температурных перемещений", 1));
-    body.push_str(&math_paragraph(
-        "ΔT = α·Σ kα·[sₜ·t′·∫m ds/h + t₀·∫n ds],  t′=|t₁−t₂|",
-    ));
-    body.push_str(&paragraph(
+    if effects.thermal {
+        body.push_str(page_break());
+        body.push_str(&heading("Расчёт температурных перемещений", 1));
+        body.push_str(&math_paragraph(
+            "ΔT = α·Σ kα·[sₜ·t′·∫m ds/h + t₀·∫n ds],  t′=|t₁−t₂|",
+        ));
+        body.push_str(&paragraph(
         if effects.thermal {
             "Температурное воздействие включено в итог. t′ всегда берётся по модулю; знак изгиба определяется стороной наиболее нагретых волокон."
         } else {
@@ -215,58 +245,69 @@ fn build_document_xml(
         None,
         false,
     ));
-    append_thermal_component(
-        &mut body,
-        "Горизонтальное температурное перемещение",
-        "Δx(T)",
-        &thermal.horizontal,
-        7,
-    );
-    append_thermal_component(
-        &mut body,
-        "Вертикальное температурное перемещение",
-        "Δy(T)",
-        &thermal.vertical,
-        8,
-    );
-    append_thermal_component(
-        &mut body,
-        "Температурный поворот точки",
-        "φ(T)",
-        &thermal.rotation,
-        9,
-    );
+        append_thermal_component(
+            &mut body,
+            "Горизонтальное температурное перемещение",
+            "Δx(T)",
+            &thermal.horizontal,
+            7,
+        );
+        append_thermal_component(
+            &mut body,
+            "Вертикальное температурное перемещение",
+            "Δy(T)",
+            &thermal.vertical,
+            8,
+        );
+        append_thermal_component(
+            &mut body,
+            "Температурный поворот точки",
+            "φ(T)",
+            &thermal.rotation,
+            9,
+        );
+    }
 
     body.push_str(&heading("Итог", 1));
-    let summary_rows = vec![
-        vec![
+    let mut summary_rows = Vec::new();
+    if effects.force {
+        summary_rows.push(vec![
             "Силовое".into(),
-            included_value(effects.force, &displacement_views(horizontal)),
-            included_value(effects.force, &displacement_views(vertical)),
-            included_value(effects.force, &displacement_views(rotation)),
-        ],
-        vec![
+            displacement_views(horizontal),
+            displacement_views(vertical),
+            displacement_views(rotation),
+        ]);
+    }
+    if effects.thermal {
+        summary_rows.push(vec![
             "Температурное".into(),
-            included_value(
-                effects.thermal,
-                &thermal.horizontal.formatted_displacement(),
-            ),
-            included_value(effects.thermal, &thermal.vertical.formatted_displacement()),
-            included_value(effects.thermal, &thermal.rotation.formatted_displacement()),
-        ],
-        vec![
+            thermal.horizontal.formatted_displacement(),
+            thermal.vertical.formatted_displacement(),
+            thermal.rotation.formatted_displacement(),
+        ]);
+    }
+    if effects.kinematic {
+        summary_rows.push(vec![
             "Кинематическое".into(),
-            "0 (не реализовано)".into(),
-            "0 (не реализовано)".into(),
-            "0 (не реализовано)".into(),
-        ],
-        vec![
-            "ИТОГО".into(),
-            combined_value(horizontal, &thermal.horizontal, effects),
-            combined_value(vertical, &thermal.vertical, effects),
-            combined_value(rotation, &thermal.rotation, effects),
-        ],
-    ];
+            "не реализовано".into(),
+            "не реализовано".into(),
+            "не реализовано".into(),
+        ]);
+    }
+    if included_effects.is_empty() {
+        summary_rows.push(vec![
+            "Составляющие".into(),
+            "не выбраны".into(),
+            "не выбраны".into(),
+            "не выбраны".into(),
+        ]);
+    }
+    summary_rows.push(vec![
+        "ИТОГО".into(),
+        combined_value(horizontal, &thermal.horizontal, effects),
+        combined_value(vertical, &thermal.vertical, effects),
+        combined_value(rotation, &thermal.rotation, effects),
+    ]);
     body.push_str(&table(&["Воздействие", "Δx", "Δy", "φ"], &summary_rows));
     body.push_str(&final_result_paragraph(&format!(
         "Точка {target}: Δx = {}; Δy = {}; φ = {}",
@@ -472,14 +513,6 @@ fn append_thermal_component(
         "{symbol} = {}",
         result.formatted_displacement()
     )));
-}
-
-fn included_value(included: bool, value: &str) -> String {
-    if included {
-        value.into()
-    } else {
-        "0 (не включено)".into()
-    }
 }
 
 fn combined_value(
@@ -746,7 +779,7 @@ fn core_properties_xml() -> &'static str {
 }
 
 fn app_properties_xml() -> &'static str {
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.6.1</AppVersion></Properties>"#
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.6.2</AppVersion></Properties>"#
 }
 
 fn styles_xml() -> &'static str {
@@ -1219,7 +1252,11 @@ mod tests {
             &model(),
             Rigidity::Symbolic,
             ThermalExpansion::Symbolic,
-            EffectsSelection::default(),
+            EffectsSelection {
+                force: true,
+                thermal: true,
+                kinematic: false,
+            },
         )
         .unwrap();
         assert!(bytes.starts_with(b"PK\x03\x04"));
