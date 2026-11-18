@@ -376,6 +376,49 @@ pub struct Node {
     pub position: Point,
 }
 
+/// Обозначение точки в порядке Excel: A…Z, AA…AZ, BA…
+pub fn alphabetical_node_id(mut index: usize) -> String {
+    let mut label = String::new();
+    loop {
+        label.insert(0, (b'A' + (index % 26) as u8) as char);
+        if index < 26 {
+            break;
+        }
+        index = index / 26 - 1;
+    }
+    label
+}
+
+pub fn next_node_id(nodes: &[Node]) -> String {
+    (0..)
+        .map(alphabetical_node_id)
+        .find(|candidate| {
+            nodes
+                .iter()
+                .all(|node| !node.id.trim().eq_ignore_ascii_case(candidate))
+        })
+        .expect("в последовательности имён всегда найдётся свободное")
+}
+
+/// Имя по направлению стержня. Дефис устраняет неоднозначность длинных имён.
+pub fn rod_id_from_nodes(nodes: &[Node], start: usize, end: usize) -> Option<String> {
+    let start = nodes.get(start)?.id.trim();
+    let end = nodes.get(end)?.id.trim();
+    if start.is_empty() || end.is_empty() {
+        return None;
+    }
+    let separator = if start.chars().count() == 1 && end.chars().count() == 1 {
+        ""
+    } else {
+        "-"
+    };
+    Some(format!("{start}{separator}{end}"))
+}
+
+fn same_position(a: Point, b: Point) -> bool {
+    (a.x - b.x).abs() <= EPS && (a.y - b.y).abs() <= EPS
+}
+
 /// Стержень между двумя узлами с грузовой и тремя единичными эпюрами.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Rod {
@@ -417,6 +460,30 @@ pub struct Rod {
     pub unit_normal_rotation_diagram: Diagram,
 }
 
+impl Rod {
+    /// Новый стержень без заданных эпюр и температурного воздействия.
+    pub fn blank(id: String, start_node: usize, end_node: usize) -> Self {
+        Self {
+            id,
+            start_node,
+            end_node,
+            rigidity_factor: 1.0,
+            section_height: 0.5,
+            thermal_expansion_factor: 1.0,
+            temperature: None,
+            normal_diagram: Diagram::default(),
+            shear_diagram: Diagram::default(),
+            load_diagram: Diagram::default(),
+            unit_x_diagram: Diagram::default(),
+            unit_y_diagram: Diagram::default(),
+            unit_rotation_diagram: Diagram::default(),
+            unit_normal_x_diagram: Diagram::default(),
+            unit_normal_y_diagram: Diagram::default(),
+            unit_normal_rotation_diagram: Diagram::default(),
+        }
+    }
+}
+
 /// Постоянные по длине стержня изменения температуры относительно исходного
 /// состояния. Первая сторона — верхняя для горизонтального стержня и левая
 /// для вертикального; вторая — нижняя/правая.
@@ -424,6 +491,90 @@ pub struct Rod {
 pub struct TemperatureLoad {
     pub upper_or_left: f64,
     pub lower_or_right: f64,
+}
+
+/// Закреплённое направление опоры и заданное перемещение связи.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SupportDirection {
+    Horizontal,
+    Vertical,
+    Rotation,
+}
+
+impl SupportDirection {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Horizontal => "X",
+            Self::Vertical => "Y",
+            Self::Rotation => "φ",
+        }
+    }
+}
+
+/// Реакции берутся из трёх соответствующих единичных систем.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SupportMotion {
+    pub node: usize,
+    pub direction: SupportDirection,
+    pub displacement: f64,
+    pub unit_x_reaction: f64,
+    pub unit_y_reaction: f64,
+    pub unit_rotation_reaction: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KinematicContribution {
+    pub node_id: String,
+    pub direction: SupportDirection,
+    pub displacement: f64,
+    pub unit_reaction: f64,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KinematicResult {
+    pub contributions: Vec<KinematicContribution>,
+    pub total: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KinematicDisplacementComponents {
+    pub horizontal: KinematicResult,
+    pub vertical: KinematicResult,
+    pub rotation: KinematicResult,
+}
+
+/// Для каждой опорной связи вычисляет −Rᵢ·cᵢ, сохраняя и нулевые слагаемые.
+pub fn calculate_kinematic_displacement_components(
+    model: &StructuralModel,
+) -> Result<KinematicDisplacementComponents, String> {
+    model.validate()?;
+    let calculate = |select: fn(&SupportMotion) -> f64| {
+        let contributions = model
+            .supports
+            .iter()
+            .map(|support| {
+                let reaction = select(support);
+                KinematicContribution {
+                    node_id: model.nodes[support.node].id.clone(),
+                    direction: support.direction,
+                    displacement: support.displacement,
+                    unit_reaction: reaction,
+                    value: -reaction * support.displacement,
+                }
+            })
+            .collect::<Vec<_>>();
+        let total = contributions.iter().map(|item| item.value).sum();
+        KinematicResult {
+            contributions,
+            total,
+        }
+    };
+    Ok(KinematicDisplacementComponents {
+        horizontal: calculate(|s| s.unit_x_reaction),
+        vertical: calculate(|s| s.unit_y_reaction),
+        rotation: calculate(|s| s.unit_rotation_reaction),
+    })
 }
 
 impl Default for TemperatureLoad {
@@ -470,6 +621,8 @@ pub struct StructuralModel {
     pub nodes: Vec<Node>,
     pub rods: Vec<Rod>,
     pub target_node: usize,
+    #[serde(default)]
+    pub supports: Vec<SupportMotion>,
 }
 
 /// Компонента искомого перемещения.
@@ -482,6 +635,67 @@ pub enum DisplacementDirection {
 
 impl StructuralModel {
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_for_loading()?;
+        self.validate_unique_geometry()
+    }
+
+    /// Проверка новых ограничений независимо от полноты черновика таблицы.
+    pub fn validate_unique_geometry(&self) -> Result<(), String> {
+        for (index, node) in self.nodes.iter().enumerate() {
+            for earlier in &self.nodes[..index] {
+                if node.id.trim().to_lowercase() == earlier.id.trim().to_lowercase() {
+                    return Err(format!(
+                        "названия точек '{}' и '{}' совпадают",
+                        earlier.id, node.id
+                    ));
+                }
+                if same_position(node.position, earlier.position) {
+                    return Err(format!(
+                        "точки {} и {} имеют одинаковые координаты",
+                        earlier.id, node.id
+                    ));
+                }
+            }
+        }
+        for (index, rod) in self.rods.iter().enumerate() {
+            for earlier in &self.rods[..index] {
+                if rod.id.trim().to_lowercase() == earlier.id.trim().to_lowercase() {
+                    return Err(format!(
+                        "названия стержней '{}' и '{}' совпадают",
+                        earlier.id, rod.id
+                    ));
+                }
+                let Some((a, b)) = self
+                    .nodes
+                    .get(rod.start_node)
+                    .zip(self.nodes.get(rod.end_node))
+                else {
+                    continue;
+                };
+                let Some((c, d)) = self
+                    .nodes
+                    .get(earlier.start_node)
+                    .zip(self.nodes.get(earlier.end_node))
+                else {
+                    continue;
+                };
+                if (same_position(a.position, c.position) && same_position(b.position, d.position))
+                    || (same_position(a.position, d.position)
+                        && same_position(b.position, c.position))
+                {
+                    return Err(format!(
+                        "стержни {} и {} совпадают по концам",
+                        earlier.id, rod.id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Проверки старого формата, без новых ограничений геометрии и написания имён.
+    /// Позволяет открыть проект с конфликтом для его исправления.
+    pub fn validate_for_loading(&self) -> Result<(), String> {
         if self.nodes.is_empty() {
             return Err("модель должна содержать хотя бы одну точку".into());
         }
@@ -503,6 +717,38 @@ impl StructuralModel {
             }
             if self.nodes[..index].iter().any(|other| other.id == node.id) {
                 return Err(format!("ID точки '{}' повторяется", node.id));
+            }
+        }
+        for (index, support) in self.supports.iter().enumerate() {
+            if support.node >= self.nodes.len() {
+                return Err(format!(
+                    "опора {} ссылается на отсутствующую точку",
+                    index + 1
+                ));
+            }
+            if self.supports[..index]
+                .iter()
+                .any(|other| other.node == support.node && other.direction == support.direction)
+            {
+                return Err(format!(
+                    "для точки {} направление {} задано дважды",
+                    self.nodes[support.node].id,
+                    support.direction.symbol()
+                ));
+            }
+            if [
+                support.displacement,
+                support.unit_x_reaction,
+                support.unit_y_reaction,
+                support.unit_rotation_reaction,
+            ]
+            .iter()
+            .any(|value| !value.is_finite())
+            {
+                return Err(format!(
+                    "опора {}: значения должны быть конечными",
+                    index + 1
+                ));
             }
         }
         for (index, rod) in self.rods.iter().enumerate() {
@@ -562,6 +808,67 @@ impl StructuralModel {
             rod.unit_normal_rotation_diagram.validate()?;
         }
         Ok(())
+    }
+
+    pub fn next_free_rod_endpoints(&self) -> Option<(usize, usize)> {
+        let count = self.nodes.len();
+        let pairs = (0..count.saturating_sub(1))
+            .map(|start| (start, start + 1))
+            .chain((0..count).flat_map(|start| ((start + 1)..count).map(move |end| (start, end))));
+        pairs.into_iter().find(|(start, end)| {
+            !self.rods.iter().any(|rod| {
+                (rod.start_node == *start && rod.end_node == *end)
+                    || (rod.start_node == *end && rod.end_node == *start)
+            })
+        })
+    }
+
+    pub fn unique_rod_id(&self, start: usize, end: usize) -> Option<String> {
+        let base = rod_id_from_nodes(&self.nodes, start, end)?;
+        if self
+            .rods
+            .iter()
+            .all(|rod| !rod.id.trim().eq_ignore_ascii_case(&base))
+        {
+            return Some(base);
+        }
+        (2..)
+            .map(|number| format!("{base}-{number}"))
+            .find(|candidate| {
+                self.rods
+                    .iter()
+                    .all(|rod| !rod.id.trim().eq_ignore_ascii_case(candidate))
+            })
+    }
+
+    /// Обновляет только имена, совпадавшие с прежним автоматическим именем.
+    pub fn refresh_generated_rod_ids(
+        &mut self,
+        previous_nodes: &[Node],
+        previous_rods: &[(String, usize, usize)],
+    ) {
+        for (rod, (old_id, old_start, old_end)) in self.rods.iter_mut().zip(previous_rods.iter()) {
+            if rod.id != *old_id {
+                continue;
+            }
+            let Some(old_base) = rod_id_from_nodes(previous_nodes, *old_start, *old_end) else {
+                continue;
+            };
+            let suffix = if old_id == &old_base {
+                Some(None)
+            } else {
+                old_id
+                    .strip_prefix(&format!("{old_base}-"))
+                    .filter(|part| part.parse::<usize>().is_ok_and(|number| number >= 2))
+                    .map(Some)
+            };
+            if let (Some(suffix), Some(new_base)) = (
+                suffix,
+                rod_id_from_nodes(&self.nodes, rod.start_node, rod.end_node),
+            ) {
+                rod.id = suffix.map_or(new_base.clone(), |part| format!("{new_base}-{part}"));
+            }
+        }
     }
 
     pub fn rod_length(&self, rod: &Rod) -> Result<f64, String> {
@@ -1223,12 +1530,141 @@ mod tests {
                 unit_normal_rotation_diagram: Diagram::default(),
             }],
             target_node: 1,
+            supports: Vec::new(),
         };
         assert!((model.rod_length(&model.rods[0]).unwrap() - 2.0).abs() < EPS);
         let result = calculate_displacement_components(&model, Rigidity::Symbolic).unwrap();
         assert!((result.horizontal.numerator - 12.0).abs() < EPS);
         assert!((result.vertical.numerator + 4.0).abs() < EPS);
         assert!((result.rotation.numerator - 2.0).abs() < EPS);
+    }
+
+    #[test]
+    fn kinematic_displacement_uses_unit_reactions_and_keeps_zero_terms() {
+        let model = StructuralModel {
+            nodes: vec![
+                Node {
+                    id: "A".into(),
+                    position: Point { x: 0.0, y: 0.0 },
+                },
+                Node {
+                    id: "B".into(),
+                    position: Point { x: 2.0, y: 0.0 },
+                },
+            ],
+            rods: vec![Rod::blank("AB".into(), 0, 1)],
+            target_node: 1,
+            supports: vec![
+                SupportMotion {
+                    node: 0,
+                    direction: SupportDirection::Horizontal,
+                    displacement: 0.5,
+                    unit_x_reaction: -2.0,
+                    unit_y_reaction: 3.0,
+                    unit_rotation_reaction: 4.0,
+                },
+                SupportMotion {
+                    node: 0,
+                    direction: SupportDirection::Vertical,
+                    displacement: 0.0,
+                    unit_x_reaction: 10.0,
+                    unit_y_reaction: 10.0,
+                    unit_rotation_reaction: 10.0,
+                },
+            ],
+        };
+        let result = calculate_kinematic_displacement_components(&model).unwrap();
+        assert_eq!(result.horizontal.total, 1.0);
+        assert_eq!(result.vertical.total, -1.5);
+        assert_eq!(result.rotation.total, -2.0);
+        assert_eq!(result.horizontal.contributions.len(), 2);
+        assert_eq!(result.horizontal.contributions[1].value, 0.0);
+        let mut duplicate = model;
+        duplicate.supports[1].direction = SupportDirection::Horizontal;
+        assert!(duplicate.validate().unwrap_err().contains("задано дважды"));
+    }
+
+    #[test]
+    fn point_and_rod_names_follow_endpoints() {
+        assert_eq!(alphabetical_node_id(0), "A");
+        assert_eq!(alphabetical_node_id(25), "Z");
+        assert_eq!(alphabetical_node_id(26), "AA");
+        assert_eq!(alphabetical_node_id(51), "AZ");
+        assert_eq!(alphabetical_node_id(52), "BA");
+        let nodes = vec![
+            Node {
+                id: "AA".into(),
+                position: Point { x: 0.0, y: 0.0 },
+            },
+            Node {
+                id: "B".into(),
+                position: Point { x: 1.0, y: 0.0 },
+            },
+        ];
+        assert_eq!(next_node_id(&nodes), "A");
+        assert_eq!(rod_id_from_nodes(&nodes, 0, 1).as_deref(), Some("AA-B"));
+        let mut model = StructuralModel {
+            nodes: nodes.clone(),
+            rods: vec![Rod::blank("AA-B".into(), 0, 1)],
+            target_node: 0,
+            supports: Vec::new(),
+        };
+        let old = vec![("AA-B".into(), 0, 1)];
+        model.nodes[0].id = "C".into();
+        model.refresh_generated_rod_ids(&nodes, &old);
+        assert_eq!(model.rods[0].id, "CB");
+        model.nodes.push(Node {
+            id: "D".into(),
+            position: Point { x: 2.0, y: 0.0 },
+        });
+        let old_nodes = model.nodes.clone();
+        model.rods[0].id = "CB-2".into();
+        let previous = vec![("CB-2".into(), 0, 1)];
+        model.rods[0].end_node = 2;
+        model.refresh_generated_rod_ids(&old_nodes, &previous);
+        assert_eq!(model.rods[0].id, "CD-2");
+        model.rods[0].id = "Ригель".into();
+        model.nodes[0].id = "E".into();
+        let previous = vec![("Ригель".into(), 0, 1)];
+        model.refresh_generated_rod_ids(&model.nodes.clone(), &previous);
+        assert_eq!(model.rods[0].id, "Ригель");
+    }
+
+    #[test]
+    fn duplicate_positions_and_reversed_rods_are_rejected() {
+        let mut model = StructuralModel {
+            nodes: vec![
+                Node {
+                    id: "A".into(),
+                    position: Point { x: 0.0, y: 0.0 },
+                },
+                Node {
+                    id: "B".into(),
+                    position: Point { x: 2.0, y: 0.0 },
+                },
+                Node {
+                    id: "C".into(),
+                    position: Point { x: 0.0, y: 1.0e-10 },
+                },
+            ],
+            rods: vec![Rod::blank("AB".into(), 0, 1)],
+            target_node: 1,
+            supports: Vec::new(),
+        };
+        assert!(model
+            .validate()
+            .unwrap_err()
+            .contains("одинаковые координаты"));
+        assert!(model.validate_for_loading().is_ok());
+        model.nodes[2].position.y = 1.0;
+        model.rods.push(Rod::blank("BA".into(), 1, 0));
+        assert!(model
+            .validate()
+            .unwrap_err()
+            .contains("совпадают по концам"));
+        model.rods.pop();
+        model.nodes[2].id = " a ".into();
+        assert!(model.validate().unwrap_err().contains("названия точек"));
     }
 
     #[test]
@@ -1300,6 +1736,7 @@ mod tests {
                 unit_normal_rotation_diagram: Diagram::default(),
             }],
             target_node: 1,
+            supports: Vec::new(),
         };
         let result =
             calculate_thermal_displacement_components(&model, ThermalExpansion::Symbolic).unwrap();

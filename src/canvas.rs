@@ -4,7 +4,7 @@ use eframe::egui::{
     self, Align2, Color32, CursorIcon, FontFamily, FontId, PointerButton, Pos2, Rect, RichText,
     Sense, Shape, Stroke, Vec2,
 };
-use mohr_frame::{format_number, Diagram, Point, Rod, StructuralModel};
+use mohr_frame::{format_number, Diagram, Point, Rod, StructuralModel, SupportDirection};
 use serde::{Deserialize, Serialize};
 
 pub const GOST_FONT_FAMILY: &str = "gost_type_a";
@@ -230,6 +230,9 @@ pub fn frame_canvas(
             draw_temperatures(&painter, model, &transform);
         }
         draw_nodes(&painter, model, &transform);
+        if options.diagram.is_none() {
+            draw_supports(&painter, model, &transform);
+        }
     });
 }
 
@@ -331,6 +334,46 @@ fn draw_nodes(painter: &egui::Painter, model: &StructuralModel, transform: &Canv
             Align2::LEFT_TOP,
             &node.id,
             FontId::proportional(12.0),
+            color,
+        );
+    }
+}
+
+/// Подписи заданных перемещений рядом с закреплёнными направлениями узла.
+fn draw_supports(painter: &egui::Painter, model: &StructuralModel, transform: &CanvasTransform) {
+    let color = Color32::from_rgb(105, 210, 235);
+    for support in &model.supports {
+        let Some(node) = model.nodes.get(support.node) else {
+            continue;
+        };
+        let point = transform.point(node.position);
+        let (line, offset) = match support.direction {
+            SupportDirection::Horizontal => (
+                [point + Vec2::new(-20.0, 0.0), point + Vec2::new(-8.0, 0.0)],
+                Vec2::new(10.0, -30.0),
+            ),
+            SupportDirection::Vertical => (
+                [point + Vec2::new(0.0, 8.0), point + Vec2::new(0.0, 20.0)],
+                Vec2::new(10.0, -16.0),
+            ),
+            SupportDirection::Rotation => (
+                [
+                    point + Vec2::new(-10.0, -10.0),
+                    point + Vec2::new(-18.0, -18.0),
+                ],
+                Vec2::new(10.0, -2.0),
+            ),
+        };
+        painter.line_segment(line, Stroke::new(2.0, color));
+        painter.text(
+            point + offset,
+            Align2::LEFT_CENTER,
+            format!(
+                "{}: c={}",
+                support.direction.symbol(),
+                format_number(support.displacement)
+            ),
+            FontId::proportional(11.0),
             color,
         );
     }
@@ -556,6 +599,7 @@ mod tests {
             ],
             rods: Vec::new(),
             target_node: 0,
+            supports: Vec::new(),
         }
     }
 

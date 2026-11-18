@@ -3,8 +3,9 @@
 mod canvas;
 mod docx_report;
 mod project;
+mod table_editor;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use canvas::{frame_canvas, CanvasOptions, CanvasViewState, DiagramChoice, GOST_FONT_FAMILY};
 use docx_report::build_word_report;
@@ -13,10 +14,11 @@ use eframe::egui::{
     Vec2,
 };
 use mohr_frame::{
-    calculate_displacement_components, calculate_thermal_displacement_components, format_number,
-    CalculationResult, Diagram, DiagramKind, EffectsSelection, FiberSide, Frame, Node, Ordinate,
-    Point, Rigidity, Rod, SegmentOrientation, StructuralModel, TemperatureLoad,
-    ThermalCalculationResult, ThermalExpansion,
+    calculate_displacement_components, calculate_kinematic_displacement_components,
+    calculate_thermal_displacement_components, format_number, next_node_id, CalculationResult,
+    Diagram, DiagramKind, EffectsSelection, FiberSide, Frame, KinematicResult, Node, Ordinate,
+    Point, Rigidity, Rod, SegmentOrientation, StructuralModel, SupportDirection, SupportMotion,
+    TemperatureLoad, ThermalCalculationResult, ThermalExpansion,
 };
 use project::{
     export_for_v050, export_for_v050_for_path, load_project_from_path, project_name_from_path,
@@ -25,6 +27,7 @@ use project::{
 };
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
+use table_editor::TableEditor;
 
 const APP_KEY: &str = "mohr-frame-gui";
 const STORAGE_KEY: &str = "frame_app_state";
@@ -89,6 +92,8 @@ struct MohrApp {
     project_message_is_error: bool,
     #[serde(skip)]
     confirm_clear: bool,
+    #[serde(skip)]
+    table_editor: TableEditor,
     /// Поле используется только для однократного импорта состояния старой версии.
     #[serde(default, rename = "frame", skip_serializing)]
     legacy_frame: Frame,
@@ -111,6 +116,7 @@ impl Default for MohrApp {
             project_message: String::new(),
             project_message_is_error: false,
             confirm_clear: false,
+            table_editor: TableEditor::default(),
             legacy_frame: Frame::default(),
         }
     }
@@ -202,18 +208,24 @@ impl MohrApp {
         let result = load_project_from_path(&path);
         match result {
             Ok(loaded) => {
+                let geometry_warning = loaded.geometry_warning.clone();
                 if let Ok(name) = project_name_from_path(&loaded.path) {
                     self.project_name = name;
                 }
                 self.project_path = Some(loaded.path.clone());
                 self.model = loaded.data.model;
+                self.table_editor.close();
                 self.rigidity = loaded.data.rigidity;
                 self.thermal_expansion = loaded.data.thermal_expansion;
                 self.effects = loaded.data.effects;
                 self.show_values = loaded.data.show_values;
                 self.canvas_view = loaded.data.view_state;
                 self.clamp_selection();
-                self.project_message = if loaded.migrated_from_legacy {
+                self.project_message = if let Some(warning) = &geometry_warning {
+                    format!(
+                        "Проект открыт для исправления: {warning}. Расчёт и сохранение доступны после устранения конфликта."
+                    )
+                } else if loaded.migrated_from_legacy {
                     format!(
                         "Открыт проект предыдущей версии: {}. При сохранении будет создан формат v{}.",
                         loaded.path.display(),
@@ -222,7 +234,7 @@ impl MohrApp {
                 } else {
                     format!("Открыто: {}", loaded.path.display())
                 };
-                self.project_message_is_error = false;
+                self.project_message_is_error = geometry_warning.is_some();
             }
             Err(error) => {
                 self.project_message = error;
@@ -279,6 +291,7 @@ impl MohrApp {
     }
 
     fn clear_workspace(&mut self) {
+        self.table_editor.close();
         self.model = StructuralModel::default();
         self.rigidity = Rigidity::Symbolic;
         self.thermal_expansion = ThermalExpansion::Symbolic;
@@ -332,21 +345,21 @@ impl MohrApp {
                     self.project_path = None;
                 }
                 ui.monospace(".mohr.ron");
-                if ui.button("Сохранить").clicked() {
+                if ui.add_enabled(!self.table_editor.open, egui::Button::new("Сохранить")).clicked() {
                     self.save_project_file();
                 }
                 if ui
-                    .button("Открыть…")
+                    .add_enabled(!self.table_editor.open, egui::Button::new("Открыть…"))
                     .on_hover_text("Выбрать файл проекта *.mohr.ron в Finder или Проводнике")
                     .clicked()
                 {
                     self.open_project_file();
                 }
-                if ui.button("Экспорт Word").clicked() {
+                if ui.add_enabled(!self.table_editor.open, egui::Button::new("Экспорт Word")).clicked() {
                     self.export_word_report();
                 }
                 if ui
-                    .button("Экспорт v0.5.0")
+                    .add_enabled(!self.table_editor.open, egui::Button::new("Экспорт v0.5.0"))
                     .on_hover_text(
                         "Создать отдельную копию без mφ и масштаба холста, которую откроет v0.5.0",
                     )
@@ -355,7 +368,7 @@ impl MohrApp {
                     self.export_legacy_project();
                 }
                 if ui
-                    .add(
+                    .add_enabled(!self.table_editor.open,
                         egui::Button::new(
                             RichText::new("Очистить схему").color(Color32::from_rgb(255, 225, 225)),
                         )
@@ -385,10 +398,7 @@ impl MohrApp {
                 ui.strong("Включить в итог отчёта:");
                 ui.checkbox(&mut self.effects.force, "силовое");
                 ui.checkbox(&mut self.effects.thermal, "температурное");
-                ui.add_enabled(
-                    false,
-                    egui::Checkbox::new(&mut self.effects.kinematic, "кинематическое (скоро)"),
-                );
+                ui.checkbox(&mut self.effects.kinematic, "кинематическое");
             });
             if !self.project_message.is_empty() {
                 let color = if self.project_message_is_error {
@@ -450,7 +460,7 @@ impl MohrApp {
                 x: node.position.x + 2.0,
                 y: node.position.y,
             });
-        let id = next_node_id(&self.model);
+        let id = next_node_id(&self.model.nodes);
         self.model.nodes.push(Node { id, position });
         self.selected_node = self.model.nodes.len() - 1;
     }
@@ -476,6 +486,14 @@ impl MohrApp {
                 rod.end_node -= 1;
             }
         }
+        self.model
+            .supports
+            .retain(|support| support.node != removed);
+        for support in &mut self.model.supports {
+            if support.node > removed {
+                support.node -= 1;
+            }
+        }
         if self.model.target_node > removed {
             self.model.target_node -= 1;
         }
@@ -483,30 +501,15 @@ impl MohrApp {
     }
 
     fn add_rod(&mut self) {
-        if self.model.nodes.len() < 2 {
+        let Some((start_node, end_node)) = self.model.next_free_rod_endpoints() else {
+            self.project_message = "Все пары точек уже соединены стержнями".into();
+            self.project_message_is_error = true;
             return;
-        }
-        let end_node = self.model.nodes.len() - 1;
-        let start_node = end_node.saturating_sub(1);
-        let id = next_rod_id(&self.model);
-        self.model.rods.push(Rod {
-            id,
-            start_node,
-            end_node,
-            rigidity_factor: 1.0,
-            section_height: 0.5,
-            thermal_expansion_factor: 1.0,
-            temperature: None,
-            normal_diagram: zero_diagram(),
-            shear_diagram: zero_diagram(),
-            load_diagram: zero_diagram(),
-            unit_x_diagram: zero_diagram(),
-            unit_y_diagram: zero_diagram(),
-            unit_rotation_diagram: zero_diagram(),
-            unit_normal_x_diagram: zero_diagram(),
-            unit_normal_y_diagram: zero_diagram(),
-            unit_normal_rotation_diagram: zero_diagram(),
-        });
+        };
+        let Some(id) = self.model.unique_rod_id(start_node, end_node) else {
+            return;
+        };
+        self.model.rods.push(Rod::blank(id, start_node, end_node));
         self.selected_rod = self.model.rods.len() - 1;
     }
 
@@ -523,6 +526,10 @@ impl MohrApp {
             .default_size(410.0)
             .size_range(360.0..=560.0)
             .show(root_ui, |ui| {
+                if self.table_editor.open {
+                    ui.label("Табличное задание открыто. Изменения применяются кнопкой «Применить» в отдельном окне.");
+                    return;
+                }
                 ui.heading("Узловая модель рамы");
                 ui.small("Сначала задайте точки, затем соедините их стержнями");
                 ui.separator();
@@ -539,6 +546,9 @@ impl MohrApp {
                         self.nodes_editor(ui);
                         ui.separator();
                         self.rods_editor(ui, tab);
+                        if let Err(error) = self.model.validate_unique_geometry() {
+                            ui.colored_label(Color32::LIGHT_RED, error);
+                        }
                         ui.separator();
                         ui.checkbox(&mut self.show_values, "Показывать ординаты");
                         if tab == WorkspaceTab::ForceDisplacement {
@@ -557,6 +567,13 @@ impl MohrApp {
     }
 
     fn nodes_editor(&mut self, ui: &mut egui::Ui) {
+        let previous_nodes = self.model.nodes.clone();
+        let previous_rods = self
+            .model
+            .rods
+            .iter()
+            .map(|rod| (rod.id.clone(), rod.start_node, rod.end_node))
+            .collect::<Vec<_>>();
         ui.strong("1. Точки");
         ui.horizontal_wrapped(|ui| {
             for (index, node) in self.model.nodes.iter().enumerate() {
@@ -580,6 +597,9 @@ impl MohrApp {
             {
                 self.remove_selected_node();
             }
+            if ui.button("Табличный ввод…").clicked() {
+                self.table_editor.open_with(&self.model);
+            }
         });
 
         if let Some(node) = self.model.nodes.get_mut(self.selected_node) {
@@ -598,6 +618,8 @@ impl MohrApp {
                     ui.end_row();
                 });
         }
+        self.model
+            .refresh_generated_rod_ids(&previous_nodes, &previous_rods);
 
         ui.horizontal(|ui| {
             ui.label("Искомые перемещения точки:");
@@ -617,6 +639,13 @@ impl MohrApp {
     }
 
     fn rods_editor(&mut self, ui: &mut egui::Ui, tab: WorkspaceTab) {
+        let previous_nodes = self.model.nodes.clone();
+        let previous_rods = self
+            .model
+            .rods
+            .iter()
+            .map(|rod| (rod.id.clone(), rod.start_node, rod.end_node))
+            .collect::<Vec<_>>();
         ui.strong("2. Стержни");
         ui.horizontal_wrapped(|ui| {
             for (index, rod) in self.model.rods.iter().enumerate() {
@@ -652,6 +681,8 @@ impl MohrApp {
         } else {
             ui.colored_label(Color32::YELLOW, "Добавьте стержень между двумя точками");
         }
+        self.model
+            .refresh_generated_rod_ids(&previous_nodes, &previous_rods);
     }
 
     fn show_force_panel(&mut self, root_ui: &mut egui::Ui) {
@@ -872,20 +903,164 @@ impl MohrApp {
         });
     }
 
-    fn show_placeholder_panel(&self, root_ui: &mut egui::Ui, title: &str, description: &str) {
-        egui::CentralPanel::default().show(root_ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(90.0);
-                ui.heading(title);
-                ui.add_space(14.0);
-                ui.label(RichText::new("Раздел подготовлен, расчёт пока не реализован").size(20.0));
-                ui.add_space(8.0);
-                ui.label(description);
-                ui.add_space(18.0);
-                ui.small("Схема, геометрия и файл проекта уже общие для всех видов перемещений.");
+    fn show_kinematic_panel(&mut self, root_ui: &mut egui::Ui) {
+        if self.table_editor.open {
+            egui::CentralPanel::default().show(root_ui, |ui| {
+                ui.label("Завершите табличное задание точек и стержней.");
             });
+            return;
+        }
+        egui::Panel::left("kinematic_editor")
+            .resizable(true)
+            .default_size(480.0)
+            .size_range(410.0..=690.0)
+            .show(root_ui, |ui| {
+                ui.heading("Заданные перемещения опор");
+                ui.small("X — вправо, Y — вверх, φ — против часовой стрелки. Реакции R берутся из единичных систем для искомой точки.");
+                ui.horizontal(|ui| {
+                    ui.label("Искомая точка:");
+                    let selected = self.model.nodes.get(self.model.target_node).map_or("—", |node| node.id.as_str());
+                    ComboBox::from_id_salt("kinematic_target").selected_text(selected).show_ui(ui, |ui| {
+                        for (index, node) in self.model.nodes.iter().enumerate() {
+                            ui.selectable_value(&mut self.model.target_node, index, &node.id);
+                        }
+                    });
+                });
+                ui.small("Одна карточка на точку. Галочка включает связь; снятие галочки удаляет её значения. Поворот φ задаётся в радианах.");
+                let occupied = self.model.supports.iter().map(|support| support.node).collect::<BTreeSet<_>>();
+                let available = self.model.nodes.iter().enumerate()
+                    .filter(|(index, _)| !occupied.contains(index))
+                    .map(|(index, node)| (index, node.id.clone()))
+                    .collect::<Vec<_>>();
+                let mut add_node = None;
+                ui.add_enabled_ui(!available.is_empty(), |ui| {
+                    ui.menu_button("＋ Опорная точка", |ui| {
+                        for (index, id) in &available {
+                            if ui.button(id).clicked() {
+                                add_node = Some(*index);
+                            }
+                        }
+                    });
+                });
+                if let Some(node) = add_node {
+                    self.model.supports.push(SupportMotion {
+                        node,
+                        direction: SupportDirection::Horizontal,
+                        displacement: 0.0,
+                        unit_x_reaction: 0.0,
+                        unit_y_reaction: 0.0,
+                        unit_rotation_reaction: 0.0,
+                    });
+                }
+                ui.separator();
+                let support_nodes = self.model.supports.iter().map(|support| support.node).collect::<BTreeSet<_>>();
+                let mut remove_node = None;
+                let mut move_node = None;
+                let mut toggle = None;
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for node_index in support_nodes {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong("Опорная точка");
+                                let label = self.model.nodes.get(node_index).map_or("—", |node| node.id.as_str());
+                                ComboBox::from_id_salt(("support_node", node_index)).selected_text(label).show_ui(ui, |ui| {
+                                    for (index, node) in self.model.nodes.iter().enumerate() {
+                                        let available = index == node_index || !self.model.supports.iter().any(|support| support.node == index);
+                                        if available && ui.selectable_label(index == node_index, &node.id).clicked() && index != node_index {
+                                            move_node = Some((node_index, index));
+                                        }
+                                    }
+                                });
+                                if ui.button("Удалить точку").clicked() { remove_node = Some(node_index); }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Связи:");
+                                for direction in [SupportDirection::Horizontal, SupportDirection::Vertical, SupportDirection::Rotation] {
+                                    let mut checked = self.model.supports.iter().any(|support| support.node == node_index && support.direction == direction);
+                                    if ui.checkbox(&mut checked, direction.symbol()).changed() {
+                                        toggle = Some((node_index, direction, checked));
+                                    }
+                                }
+                            });
+                            egui::Grid::new(("support_values", node_index)).striped(true).show(ui, |ui| {
+                                ui.strong("Связь"); ui.strong("c"); ui.strong("R для Δx"); ui.strong("R для Δy"); ui.strong("R для φ"); ui.end_row();
+                                for direction in [SupportDirection::Horizontal, SupportDirection::Vertical, SupportDirection::Rotation] {
+                                    let Some(support) = self.model.supports.iter_mut().find(|support| support.node == node_index && support.direction == direction) else { continue; };
+                                    ui.label(direction.symbol());
+                                    ui.add(DragValue::new(&mut support.displacement).speed(0.01));
+                                    ui.add(DragValue::new(&mut support.unit_x_reaction).speed(0.1));
+                                    ui.add(DragValue::new(&mut support.unit_y_reaction).speed(0.1));
+                                    ui.add(DragValue::new(&mut support.unit_rotation_reaction).speed(0.1));
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                    }
+                });
+                if let Some(node) = remove_node {
+                    self.model.supports.retain(|support| support.node != node);
+                } else if let Some((old_node, new_node)) = move_node {
+                    for support in self.model.supports.iter_mut().filter(|support| support.node == old_node) {
+                        support.node = new_node;
+                    }
+                } else if let Some((node, direction, checked)) = toggle {
+                    if checked {
+                        self.model.supports.push(SupportMotion {
+                            node, direction, displacement: 0.0,
+                            unit_x_reaction: 0.0, unit_y_reaction: 0.0, unit_rotation_reaction: 0.0,
+                        });
+                    } else {
+                        self.model.supports.retain(|support| support.node != node || support.direction != direction);
+                    }
+                }
+            });
+        egui::CentralPanel::default().show(root_ui, |ui| {
+            frame_canvas(
+                ui,
+                &self.model,
+                CanvasOptions {
+                    title: "Опоры и заданные перемещения на раме",
+                    diagram: None,
+                    height: 310.0,
+                    show_values: false,
+                    show_dimensions: true,
+                    show_temperatures: false,
+                },
+                &mut self.canvas_view,
+            );
+            ui.separator();
+            match calculate_kinematic_displacement_components(&self.model) {
+                Ok(result) => {
+                    ui.heading("Кинематические перемещения");
+                    ui.small("Для каждой опорной связи: −Rᵢ·cᵢ. Нулевые слагаемые показаны.");
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        show_kinematic_result(ui, "Δx(K)", &result.horizontal);
+                        show_kinematic_result(ui, "Δy(K)", &result.vertical);
+                        show_kinematic_result(ui, "φ(K)", &result.rotation);
+                    });
+                }
+                Err(error) => {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+            }
         });
     }
+}
+
+fn show_kinematic_result(ui: &mut egui::Ui, symbol: &str, result: &KinematicResult) {
+    ui.group(|ui| {
+        ui.strong(format!("{symbol} = {}", format_number(result.total)));
+        for item in &result.contributions {
+            ui.small(format!(
+                "{} · {}: −({})·({}) = {}",
+                item.node_id,
+                item.direction.symbol(),
+                format_number(item.unit_reaction),
+                format_number(item.displacement),
+                format_number(item.value)
+            ));
+        }
+    });
 }
 
 impl eframe::App for MohrApp {
@@ -905,13 +1080,15 @@ impl eframe::App for MohrApp {
                 self.show_left_panel(ui, WorkspaceTab::ThermalDisplacement);
                 self.show_thermal_panel(ui);
             }
-            WorkspaceTab::KinematicDisplacement => self.show_placeholder_panel(
-                ui,
-                "Кинематическое перемещение",
-                "Здесь появятся заданные смещения и повороты опор, а также их вклад в перемещение выбранной точки.",
-            ),
+            WorkspaceTab::KinematicDisplacement => self.show_kinematic_panel(ui),
         }
         self.show_clear_confirmation(ui.ctx());
+        if let Some(model) = self.table_editor.show(ui.ctx()) {
+            self.model = model;
+            self.clamp_selection();
+            self.project_message = "Точки и стержни обновлены из таблицы".into();
+            self.project_message_is_error = false;
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1433,6 +1610,7 @@ fn diagram_editor_named(
                 fiber_combo(ui, side, ("q_side", unique_id));
             }
         });
+        ui.small("* Проверяйте сторону выпуклости эпюры по правилу «дождика».");
         ui.checkbox(&mut diagram.has_extremum, "Экстремум внутри участка");
     }
     ui.small(format!(
@@ -1542,6 +1720,7 @@ fn default_model() -> StructuralModel {
             unit_normal_rotation_diagram: zero_diagram(),
         }],
         target_node: 1,
+        supports: Vec::new(),
     }
 }
 
@@ -1575,6 +1754,7 @@ fn migrate_legacy_frame(frame: Frame) -> StructuralModel {
     }
     StructuralModel {
         target_node: nodes.len().saturating_sub(1).min(1),
+        supports: Vec::new(),
         nodes,
         rods,
     }
@@ -1587,16 +1767,7 @@ fn find_or_add_node(nodes: &mut Vec<Node>, point: Point, hint: Option<String>) -
         return index;
     }
     let proposed = hint.filter(|id| nodes.iter().all(|node| node.id != *id));
-    let id = proposed.unwrap_or_else(|| {
-        let mut number = nodes.len() + 1;
-        loop {
-            let candidate = format!("P{number}");
-            if nodes.iter().all(|node| node.id != candidate) {
-                break candidate;
-            }
-            number += 1;
-        }
-    });
+    let id = proposed.unwrap_or_else(|| next_node_id(nodes));
     nodes.push(Node {
         id,
         position: point,
@@ -1608,27 +1779,6 @@ fn zero_diagram() -> Diagram {
     let zero = Ordinate::from_signed(0.0).expect("нулевая ордината корректна");
     Diagram::new(DiagramKind::Linear, zero, zero, None, None, false)
         .expect("нулевая эпюра корректна")
-}
-
-fn next_node_id(model: &StructuralModel) -> String {
-    for byte in b'A'..=b'Z' {
-        let id = (byte as char).to_string();
-        if model.nodes.iter().all(|node| node.id != id) {
-            return id;
-        }
-    }
-    format!("P{}", model.nodes.len() + 1)
-}
-
-fn next_rod_id(model: &StructuralModel) -> String {
-    let mut number = model.rods.len() + 1;
-    loop {
-        let id = format!("S{number}");
-        if model.rods.iter().all(|rod| rod.id != id) {
-            return id;
-        }
-        number += 1;
-    }
 }
 
 fn orientation_from_delta(dx: f64, dy: f64) -> SegmentOrientation {

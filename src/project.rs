@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas::CanvasViewState;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 const PROJECT_FORMAT_ID: &str = "mohr-frame-project";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -57,6 +57,7 @@ pub struct LoadedProject {
     pub data: ProjectData,
     pub path: PathBuf,
     pub migrated_from_legacy: bool,
+    pub geometry_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +94,7 @@ fn save_project_with_paths(paths: &ProjectPaths, data: &ProjectData) -> Result<P
         format: PROJECT_FORMAT_ID.into(),
         schema_version: CURRENT_SCHEMA_VERSION,
         created_with: env!("CARGO_PKG_VERSION").into(),
-        minimum_reader: "0.6.0".into(),
+        minimum_reader: "0.7.0".into(),
         data: data.clone(),
     };
     let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::default())
@@ -122,10 +123,12 @@ pub fn load_project_from_path(path: &Path) -> Result<LoadedProject, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("не удалось открыть {}: {error}", path.display()))?;
     let (data, migrated_from_legacy) = deserialize_project_text(&text)?;
+    let geometry_warning = data.model.validate().err();
     Ok(LoadedProject {
         data,
         path: path.to_path_buf(),
         migrated_from_legacy,
+        geometry_warning,
     })
 }
 
@@ -204,7 +207,7 @@ pub(crate) fn deserialize_project_text(text: &str) -> Result<(ProjectData, bool)
         if file.format != PROJECT_FORMAT_ID {
             return Err(format!("неизвестный формат проекта: {}", file.format));
         }
-        file.data.model.validate()?;
+        file.data.model.validate_for_loading()?;
         return Ok((file.data, schema_version < CURRENT_SCHEMA_VERSION));
     }
 
@@ -214,7 +217,7 @@ pub(crate) fn deserialize_project_text(text: &str) -> Result<(ProjectData, bool)
         if legacy.format_version != 1 {
             return Err("неподдерживаемая версия файла".into());
         }
-        legacy.model.validate()?;
+        legacy.model.validate_for_loading()?;
         return Ok((
             ProjectData {
                 model: legacy.model,
@@ -415,7 +418,7 @@ pub fn project_root_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mohr_frame::{Diagram, Node, Point};
+    use mohr_frame::{Diagram, Node, Point, SupportDirection, SupportMotion};
 
     fn sample_data() -> ProjectData {
         ProjectData {
@@ -449,6 +452,7 @@ mod tests {
                     unit_normal_rotation_diagram: Diagram::default(),
                 }],
                 target_node: 1,
+                supports: Vec::new(),
             },
             rigidity: Rigidity::Symbolic,
             thermal_expansion: ThermalExpansion::Symbolic,
@@ -502,6 +506,14 @@ mod tests {
         let mut data = sample_data();
         data.view_state.camera.zoom = 2.5;
         data.view_state.ordinate_scales[3] = 1.75;
+        data.model.supports.push(SupportMotion {
+            node: 0,
+            direction: SupportDirection::Vertical,
+            displacement: 0.25,
+            unit_x_reaction: 2.0,
+            unit_y_reaction: -1.0,
+            unit_rotation_reaction: 0.5,
+        });
         let file = ProjectFileV2 {
             format: PROJECT_FORMAT_ID.into(),
             schema_version: CURRENT_SCHEMA_VERSION,
@@ -536,6 +548,49 @@ mod tests {
         }));
         assert_eq!(restored.thermal_expansion, ThermalExpansion::Symbolic);
         assert_eq!(restored.effects, EffectsSelection::default());
+        assert!(restored.model.supports.is_empty());
+    }
+
+    #[test]
+    fn v062_schema_is_accepted_and_marked_for_migration() {
+        let file = ProjectFileV2 {
+            format: PROJECT_FORMAT_ID.into(),
+            schema_version: 3,
+            created_with: "0.6.2".into(),
+            minimum_reader: "0.6.2".into(),
+            data: sample_data(),
+        };
+        // В файле 0.6.2 поле supports отсутствовало.
+        let text = ron::ser::to_string(&file).unwrap();
+        assert!(text.contains(",supports:[]"));
+        let text = text.replace(",supports:[]", "");
+        let (restored, migrated) = deserialize_project_text(&text).unwrap();
+        assert!(migrated);
+        assert!(restored.model.supports.is_empty());
+    }
+
+    #[test]
+    fn older_project_with_overlapping_points_opens_for_repair() {
+        let mut data = sample_data();
+        data.model.nodes.push(Node {
+            id: "C".into(),
+            position: Point { x: 0.0, y: 0.0 },
+        });
+        let file = ProjectFileV2 {
+            format: PROJECT_FORMAT_ID.into(),
+            schema_version: 3,
+            created_with: "0.6.2".into(),
+            minimum_reader: "0.6.2".into(),
+            data,
+        };
+        let text = ron::ser::to_string(&file).unwrap();
+        let (restored, migrated) = deserialize_project_text(&text).unwrap();
+        assert!(migrated);
+        assert!(restored
+            .model
+            .validate()
+            .unwrap_err()
+            .contains("одинаковые координаты"));
     }
 
     #[test]

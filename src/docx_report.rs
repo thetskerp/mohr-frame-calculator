@@ -8,10 +8,11 @@ use std::io::Cursor;
 
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use mohr_frame::{
-    calculate_displacement_components, calculate_thermal_displacement_components, format_number,
-    CalculationResult, Diagram, DisplacementComponents, EffectsSelection, FiberSide,
-    IntegrationMethod, Rigidity, StructuralModel, ThermalCalculationResult,
-    ThermalDisplacementComponents, ThermalExpansion,
+    calculate_displacement_components, calculate_kinematic_displacement_components,
+    calculate_thermal_displacement_components, format_number, CalculationResult, Diagram,
+    DisplacementComponents, EffectsSelection, FiberSide, IntegrationMethod,
+    KinematicDisplacementComponents, KinematicResult, Rigidity, StructuralModel,
+    ThermalCalculationResult, ThermalDisplacementComponents, ThermalExpansion,
 };
 
 const REPORT_IMAGE_WIDTH: u32 = 1000;
@@ -27,8 +28,11 @@ pub fn build_word_report(
     model.validate()?;
     let results = calculate_displacement_components(model, rigidity)?;
     let thermal = calculate_thermal_displacement_components(model, expansion)?;
+    let kinematic = calculate_kinematic_displacement_components(model)?;
     let scheme_png = render_scheme_png(model)?;
-    let document_xml = build_document_xml(model, rigidity, expansion, effects, &results, &thermal)?;
+    let document_xml = build_document_xml(
+        model, rigidity, expansion, effects, &results, &thermal, &kinematic,
+    )?;
 
     let mut archive = StoredZip::default();
     archive.add("[Content_Types].xml", content_types_xml().as_bytes());
@@ -52,6 +56,7 @@ fn build_document_xml(
     effects: EffectsSelection,
     force: &DisplacementComponents,
     thermal: &ThermalDisplacementComponents,
+    kinematic: &KinematicDisplacementComponents,
 ) -> Result<String, String> {
     let horizontal = &force.horizontal;
     let vertical = &force.vertical;
@@ -67,6 +72,7 @@ fn build_document_xml(
     let included_effects = [
         effects.force.then_some("силового"),
         effects.thermal.then_some("температурного"),
+        effects.kinematic.then_some("кинематического"),
     ]
     .into_iter()
     .flatten()
@@ -80,9 +86,9 @@ fn build_document_xml(
         &format!(
             "Отчёт содержит {report_scope} для точки {}. Итоговые значения: Δx = {}; Δy = {}; φ = {}.",
             xml_escape(target),
-            xml_escape(&combined_value(horizontal, &thermal.horizontal, effects)),
-            xml_escape(&combined_value(vertical, &thermal.vertical, effects)),
-            xml_escape(&combined_value(rotation, &thermal.rotation, effects))
+            xml_escape(&combined_value(horizontal, &thermal.horizontal, kinematic.horizontal.total, effects)),
+            xml_escape(&combined_value(vertical, &thermal.vertical, kinematic.vertical.total, effects)),
+            xml_escape(&combined_value(rotation, &thermal.rotation, kinematic.rotation.total, effects))
         ),
         None,
         false,
@@ -268,6 +274,28 @@ fn build_document_xml(
         );
     }
 
+    if effects.kinematic {
+        body.push_str(page_break());
+        body.push_str(&heading("Расчёт кинематических перемещений", 1));
+        body.push_str(&math_paragraph("ΔK = −Σ Rᵢ⁽¹⁾·cᵢ"));
+        body.push_str(&paragraph("Положительные X и Y направлены вправо и вверх; положительный поворот — против часовой стрелки. Реакции заданы для соответствующих единичных систем.", None, false));
+        append_kinematic_component(
+            &mut body,
+            "Горизонтальное перемещение",
+            "Δx(K)",
+            &kinematic.horizontal,
+            10,
+        );
+        append_kinematic_component(
+            &mut body,
+            "Вертикальное перемещение",
+            "Δy(K)",
+            &kinematic.vertical,
+            11,
+        );
+        append_kinematic_component(&mut body, "Поворот точки", "φ(K)", &kinematic.rotation, 12);
+    }
+
     body.push_str(&heading("Итог", 1));
     let mut summary_rows = Vec::new();
     if effects.force {
@@ -289,9 +317,9 @@ fn build_document_xml(
     if effects.kinematic {
         summary_rows.push(vec![
             "Кинематическое".into(),
-            "не реализовано".into(),
-            "не реализовано".into(),
-            "не реализовано".into(),
+            format_number(kinematic.horizontal.total),
+            format_number(kinematic.vertical.total),
+            format_number(kinematic.rotation.total),
         ]);
     }
     if included_effects.is_empty() {
@@ -304,16 +332,46 @@ fn build_document_xml(
     }
     summary_rows.push(vec![
         "ИТОГО".into(),
-        combined_value(horizontal, &thermal.horizontal, effects),
-        combined_value(vertical, &thermal.vertical, effects),
-        combined_value(rotation, &thermal.rotation, effects),
+        combined_value(
+            horizontal,
+            &thermal.horizontal,
+            kinematic.horizontal.total,
+            effects,
+        ),
+        combined_value(
+            vertical,
+            &thermal.vertical,
+            kinematic.vertical.total,
+            effects,
+        ),
+        combined_value(
+            rotation,
+            &thermal.rotation,
+            kinematic.rotation.total,
+            effects,
+        ),
     ]);
     body.push_str(&table(&["Воздействие", "Δx", "Δy", "φ"], &summary_rows));
     body.push_str(&final_result_paragraph(&format!(
         "Точка {target}: Δx = {}; Δy = {}; φ = {}",
-        combined_value(horizontal, &thermal.horizontal, effects),
-        combined_value(vertical, &thermal.vertical, effects),
-        combined_value(rotation, &thermal.rotation, effects),
+        combined_value(
+            horizontal,
+            &thermal.horizontal,
+            kinematic.horizontal.total,
+            effects
+        ),
+        combined_value(
+            vertical,
+            &thermal.vertical,
+            kinematic.vertical.total,
+            effects
+        ),
+        combined_value(
+            rotation,
+            &thermal.rotation,
+            kinematic.rotation.total,
+            effects
+        ),
     )));
     body.push_str(&paragraph(
         "Знаки Δx и Δy соответствуют направлениям глобальных осей X и Y. Положительный поворот φ направлен против часовой стрелки.",
@@ -398,6 +456,7 @@ fn append_component(
         .map(|item| format_number(item.integral))
         .collect::<Vec<_>>()
         .join(" + ");
+    let sum = if sum.is_empty() { "0" } else { &sum };
     body.push_str(&calculation_paragraph(&format!(
         "Сумма без сокращений: Σ(∫Mₚ·m₁ dx / k) = {sum} = {}",
         format_number(result.numerator)
@@ -515,9 +574,68 @@ fn append_thermal_component(
     )));
 }
 
+fn append_kinematic_component(
+    body: &mut String,
+    title: &str,
+    symbol: &str,
+    result: &KinematicResult,
+    table_number: usize,
+) {
+    body.push_str(&heading(title, 2));
+    let rows = result
+        .contributions
+        .iter()
+        .map(|item| {
+            vec![
+                item.node_id.clone(),
+                item.direction.symbol().into(),
+                format_number(item.displacement),
+                format_number(item.unit_reaction),
+                format_number(item.value),
+            ]
+        })
+        .collect::<Vec<_>>();
+    body.push_str(&caption(&format!(
+        "Таблица {table_number}  Опорные связи для {symbol}"
+    )));
+    body.push_str(&table(
+        &["Точка", "Направление", "cᵢ", "Rᵢ⁽¹⁾", "−Rᵢ⁽¹⁾·cᵢ"],
+        &rows,
+    ));
+    body.push_str(&keep_next_paragraph(
+        "Подстановка по всем опорным связям, включая нулевые слагаемые:",
+    ));
+    for item in &result.contributions {
+        body.push_str(&calculation_paragraph(&format!(
+            "{} {}: −({})·({}) = {}",
+            item.node_id,
+            item.direction.symbol(),
+            format_number(item.unit_reaction),
+            format_number(item.displacement),
+            format_number(item.value)
+        )));
+    }
+    let sum = result
+        .contributions
+        .iter()
+        .map(|item| format_number(item.value))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let sum = if sum.is_empty() { "0" } else { &sum };
+    body.push_str(&calculation_paragraph(&format!(
+        "{symbol} = {sum} = {}",
+        format_number(result.total)
+    )));
+    body.push_str(&result_paragraph(&format!(
+        "{symbol} = {}",
+        format_number(result.total)
+    )));
+}
+
 fn combined_value(
     force: &CalculationResult,
     thermal: &ThermalCalculationResult,
+    kinematic: f64,
     effects: EffectsSelection,
 ) -> String {
     let force_numeric = effects
@@ -531,19 +649,29 @@ fn combined_value(
     let all_selected_numeric = (!effects.force || force_numeric.is_some())
         && (!effects.thermal || thermal_numeric.is_some());
     if all_selected_numeric {
-        return format_number(force_numeric.unwrap_or(0.0) + thermal_numeric.unwrap_or(0.0));
+        return format_number(
+            force_numeric.unwrap_or(0.0)
+                + thermal_numeric.unwrap_or(0.0)
+                + if effects.kinematic { kinematic } else { 0.0 },
+        );
     }
     let mut terms = Vec::new();
-    if effects.force && force.numerator.abs() > 1.0e-12 {
+    if effects.force && force_numeric.is_none() && force.numerator.abs() > 1.0e-12 {
         terms.push(force.formatted_displacement());
     }
-    if effects.thermal && thermal.coefficient.abs() > 1.0e-12 {
+    if effects.thermal && thermal_numeric.is_none() && thermal.coefficient.abs() > 1.0e-12 {
         terms.push(thermal.formatted_displacement());
+    }
+    let numeric = force_numeric.unwrap_or(0.0)
+        + thermal_numeric.unwrap_or(0.0)
+        + if effects.kinematic { kinematic } else { 0.0 };
+    if numeric.abs() > 1.0e-12 {
+        terms.push(format_number(numeric));
     }
     if terms.is_empty() {
         "0".into()
     } else {
-        terms.join(" + ")
+        terms.join(" + ").replace(" + -", " - ")
     }
 }
 
@@ -779,7 +907,7 @@ fn core_properties_xml() -> &'static str {
 }
 
 fn app_properties_xml() -> &'static str {
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.6.2</AppVersion></Properties>"#
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.7.0</AppVersion></Properties>"#
 }
 
 fn styles_xml() -> &'static str {
@@ -1190,7 +1318,9 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mohr_frame::{DiagramKind, FiberSide, Node, Ordinate, Point, Rod};
+    use mohr_frame::{
+        DiagramKind, FiberSide, Node, Ordinate, Point, Rod, SupportDirection, SupportMotion,
+    };
 
     fn zero() -> Diagram {
         Diagram::new(
@@ -1243,6 +1373,7 @@ mod tests {
                 unit_normal_rotation_diagram: zero(),
             }],
             target_node: 1,
+            supports: Vec::new(),
         }
     }
 
@@ -1296,6 +1427,7 @@ mod tests {
             combined_value(
                 &force,
                 &thermal,
+                0.0,
                 EffectsSelection {
                     force: true,
                     thermal: true,
@@ -1308,6 +1440,7 @@ mod tests {
             combined_value(
                 &force,
                 &thermal,
+                0.0,
                 EffectsSelection {
                     force: false,
                     thermal: true,
@@ -1316,6 +1449,75 @@ mod tests {
             ),
             "α · 2"
         );
+    }
+
+    #[test]
+    fn mixed_symbolic_and_numeric_effects_are_summed_once() {
+        let force = CalculationResult {
+            contributions: Vec::new(),
+            numerator: 6.0,
+            rigidity: Rigidity::numeric(2.0).unwrap(),
+        };
+        let thermal = ThermalCalculationResult {
+            contributions: Vec::new(),
+            coefficient: 2.0,
+            expansion: ThermalExpansion::Symbolic,
+        };
+        assert_eq!(
+            combined_value(
+                &force,
+                &thermal,
+                -1.0,
+                EffectsSelection {
+                    force: true,
+                    thermal: true,
+                    kinematic: true
+                }
+            ),
+            "α · 2 + 2"
+        );
+    }
+
+    #[test]
+    fn report_includes_kinematic_section_only_when_selected() {
+        let mut model = model();
+        model.supports.push(SupportMotion {
+            node: 0,
+            direction: SupportDirection::Horizontal,
+            displacement: 0.5,
+            unit_x_reaction: -2.0,
+            unit_y_reaction: 0.0,
+            unit_rotation_reaction: 0.0,
+        });
+        let selected = build_word_report(
+            &model,
+            Rigidity::Symbolic,
+            ThermalExpansion::Symbolic,
+            EffectsSelection {
+                force: false,
+                thermal: false,
+                kinematic: true,
+            },
+        )
+        .unwrap();
+        let excluded = build_word_report(
+            &model,
+            Rigidity::Symbolic,
+            ThermalExpansion::Symbolic,
+            EffectsSelection {
+                force: true,
+                thermal: false,
+                kinematic: false,
+            },
+        )
+        .unwrap();
+        let heading = "Расчёт кинематических перемещений".as_bytes();
+        assert!(selected.windows(heading.len()).any(|part| part == heading));
+        assert!(!excluded.windows(heading.len()).any(|part| part == heading));
+        let thermal_heading = "Расчёт температурных перемещений".as_bytes();
+        assert!(!selected
+            .windows(thermal_heading.len())
+            .any(|part| part == thermal_heading));
     }
 
     #[test]
