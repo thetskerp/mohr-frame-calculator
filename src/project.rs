@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas::CanvasViewState;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 const PROJECT_FORMAT_ID: &str = "mohr-frame-project";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,7 +94,7 @@ fn save_project_with_paths(paths: &ProjectPaths, data: &ProjectData) -> Result<P
         format: PROJECT_FORMAT_ID.into(),
         schema_version: CURRENT_SCHEMA_VERSION,
         created_with: env!("CARGO_PKG_VERSION").into(),
-        minimum_reader: "0.7.0".into(),
+        minimum_reader: "0.7.1".into(),
         data: data.clone(),
     };
     let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::default())
@@ -167,6 +167,22 @@ pub fn export_for_v050_for_path(path: &Path, data: &ProjectData) -> Result<PathB
 
 fn export_for_v050_with_paths(paths: &ProjectPaths, data: &ProjectData) -> Result<PathBuf, String> {
     data.model.validate()?;
+    let values = data
+        .model
+        .rods
+        .iter()
+        .map(|rod| data.model.rigidity_value(rod, data.rigidity))
+        .collect::<Result<Vec<_>, _>>()?;
+    let all_numeric = values.iter().all(|value| value.numeric);
+    let all_analytic = values.iter().all(|value| !value.numeric);
+    if !all_numeric && !all_analytic {
+        return Err("экспорт v0.5.0 не поддерживает смесь числовых и аналитических EI".into());
+    }
+    let legacy_rigidity = if all_numeric {
+        Rigidity::numeric(1.0)?
+    } else {
+        Rigidity::Symbolic
+    };
     fs::create_dir_all(&paths.directory).map_err(|error| {
         format!(
             "не удалось создать папку проекта {}: {error}",
@@ -177,10 +193,24 @@ fn export_for_v050_with_paths(paths: &ProjectPaths, data: &ProjectData) -> Resul
         format_version: 1,
         model: LegacyModelExport {
             nodes: &data.model.nodes,
-            rods: data.model.rods.iter().map(LegacyRodExport::from).collect(),
+            rods: data
+                .model
+                .rods
+                .iter()
+                .zip(&values)
+                .map(|(rod, value)| {
+                    let mut legacy = LegacyRodExport::from(rod);
+                    legacy.rigidity_factor = if value.numeric {
+                        value.numeric_value().unwrap_or(1.0)
+                    } else {
+                        value.symbolic_factor
+                    };
+                    legacy
+                })
+                .collect(),
             target_node: data.model.target_node,
         },
-        rigidity: data.rigidity,
+        rigidity: legacy_rigidity,
         show_values: data.show_values,
     };
     let text = ron::ser::to_string_pretty(&legacy, ron::ser::PrettyConfig::default())
@@ -208,7 +238,12 @@ pub(crate) fn deserialize_project_text(text: &str) -> Result<(ProjectData, bool)
             return Err(format!("неизвестный формат проекта: {}", file.format));
         }
         file.data.model.validate_for_loading()?;
-        return Ok((file.data, schema_version < CURRENT_SCHEMA_VERSION));
+        let mut data = file.data;
+        if schema_version < 5 {
+            data.model
+                .ensure_property_presets(data.rigidity, data.thermal_expansion);
+        }
+        return Ok((data, schema_version < CURRENT_SCHEMA_VERSION));
     }
 
     if probe.format_version == 1 {
@@ -218,17 +253,17 @@ pub(crate) fn deserialize_project_text(text: &str) -> Result<(ProjectData, bool)
             return Err("неподдерживаемая версия файла".into());
         }
         legacy.model.validate_for_loading()?;
-        return Ok((
-            ProjectData {
-                model: legacy.model,
-                rigidity: legacy.rigidity,
-                thermal_expansion: ThermalExpansion::Symbolic,
-                effects: EffectsSelection::default(),
-                show_values: legacy.show_values,
-                view_state: CanvasViewState::default(),
-            },
-            true,
-        ));
+        let mut data = ProjectData {
+            model: legacy.model,
+            rigidity: legacy.rigidity,
+            thermal_expansion: ThermalExpansion::Symbolic,
+            effects: EffectsSelection::default(),
+            show_values: legacy.show_values,
+            view_state: CanvasViewState::default(),
+        };
+        data.model
+            .ensure_property_presets(data.rigidity, data.thermal_expansion);
+        return Ok((data, true));
     }
 
     Err("не удалось определить версию файла проекта".into())
@@ -437,6 +472,8 @@ mod tests {
                     id: "AB".into(),
                     start_node: 0,
                     end_node: 1,
+                    rigidity_preset_id: None,
+                    thermal_preset_id: None,
                     rigidity_factor: 1.0,
                     section_height: 0.5,
                     thermal_expansion_factor: 1.0,
@@ -452,6 +489,8 @@ mod tests {
                     unit_normal_rotation_diagram: Diagram::default(),
                 }],
                 target_node: 1,
+                rigidity_presets: Vec::new(),
+                thermal_presets: Vec::new(),
                 supports: Vec::new(),
             },
             rigidity: Rigidity::Symbolic,
@@ -504,6 +543,28 @@ mod tests {
     #[test]
     fn current_format_roundtrip_preserves_view_state() {
         let mut data = sample_data();
+        data.model
+            .rigidity_presets
+            .push(mohr_frame::PropertyPreset {
+                id: 7,
+                name: "Балка 2".into(),
+                value: mohr_frame::PropertyValue {
+                    numeric: true,
+                    mantissa: 2.0,
+                    exponent: 5,
+                    ..mohr_frame::PropertyValue::default()
+                },
+            });
+        data.model.thermal_presets.push(mohr_frame::PropertyPreset {
+            id: 8,
+            name: "Сталь".into(),
+            value: mohr_frame::PropertyValue {
+                symbolic_factor: 3.0,
+                ..mohr_frame::PropertyValue::default()
+            },
+        });
+        data.model.rods[0].rigidity_preset_id = Some(7);
+        data.model.rods[0].thermal_preset_id = Some(8);
         data.view_state.camera.zoom = 2.5;
         data.view_state.ordinate_scales[3] = 1.75;
         data.model.supports.push(SupportMotion {
@@ -549,6 +610,11 @@ mod tests {
         assert_eq!(restored.thermal_expansion, ThermalExpansion::Symbolic);
         assert_eq!(restored.effects, EffectsSelection::default());
         assert!(restored.model.supports.is_empty());
+        assert!(restored
+            .model
+            .rods
+            .iter()
+            .all(|rod| rod.rigidity_preset_id.is_some() && rod.thermal_preset_id.is_some()));
     }
 
     #[test]
@@ -567,6 +633,40 @@ mod tests {
         let (restored, migrated) = deserialize_project_text(&text).unwrap();
         assert!(migrated);
         assert!(restored.model.supports.is_empty());
+    }
+
+    #[test]
+    fn v070_rigidity_and_expansion_are_preserved_as_independent_presets() {
+        let mut data = sample_data();
+        data.model.rods[0].rigidity_factor = 3.0;
+        data.model.rods[0].thermal_expansion_factor = 2.0;
+        let file = ProjectFileV2 {
+            format: PROJECT_FORMAT_ID.into(),
+            schema_version: 4,
+            created_with: "0.7.0".into(),
+            minimum_reader: "0.7.0".into(),
+            data,
+        };
+        let text = ron::ser::to_string(&file).unwrap();
+        let (restored, migrated) = deserialize_project_text(&text).unwrap();
+        assert!(migrated);
+        let rod = &restored.model.rods[0];
+        assert_eq!(
+            restored
+                .model
+                .rigidity_value(rod, restored.rigidity)
+                .unwrap()
+                .symbolic_factor,
+            3.0
+        );
+        assert_eq!(
+            restored
+                .model
+                .thermal_value(rod, restored.thermal_expansion)
+                .unwrap()
+                .symbolic_factor,
+            2.0
+        );
     }
 
     #[test]

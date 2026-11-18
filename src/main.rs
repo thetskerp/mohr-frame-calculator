@@ -3,6 +3,7 @@
 mod canvas;
 mod docx_report;
 mod project;
+mod property_editor;
 mod table_editor;
 
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
@@ -17,14 +18,15 @@ use mohr_frame::{
     calculate_displacement_components, calculate_kinematic_displacement_components,
     calculate_thermal_displacement_components, format_number, next_node_id, CalculationResult,
     Diagram, DiagramKind, EffectsSelection, FiberSide, Frame, KinematicResult, Node, Ordinate,
-    Point, Rigidity, Rod, SegmentOrientation, StructuralModel, SupportDirection, SupportMotion,
-    TemperatureLoad, ThermalCalculationResult, ThermalExpansion,
+    Point, PropertyPreset, Rigidity, Rod, SegmentOrientation, StructuralModel, SupportDirection,
+    SupportMotion, TemperatureLoad, ThermalCalculationResult, ThermalExpansion,
 };
 use project::{
     export_for_v050, export_for_v050_for_path, load_project_from_path, project_name_from_path,
     project_paths, project_paths_from_scheme, project_root_dir, sanitize_project_name_input,
     save_project, save_project_to_path, save_word_report, save_word_report_for_path, ProjectData,
 };
+use property_editor::PropertyEditor;
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use table_editor::TableEditor;
@@ -94,6 +96,8 @@ struct MohrApp {
     confirm_clear: bool,
     #[serde(skip)]
     table_editor: TableEditor,
+    #[serde(skip)]
+    property_editor: PropertyEditor,
     /// Поле используется только для однократного импорта состояния старой версии.
     #[serde(default, rename = "frame", skip_serializing)]
     legacy_frame: Frame,
@@ -101,8 +105,10 @@ struct MohrApp {
 
 impl Default for MohrApp {
     fn default() -> Self {
+        let mut model = default_model();
+        model.ensure_property_presets(Rigidity::Symbolic, ThermalExpansion::Symbolic);
         Self {
-            model: default_model(),
+            model,
             rigidity: Rigidity::Symbolic,
             thermal_expansion: ThermalExpansion::Symbolic,
             effects: EffectsSelection::default(),
@@ -117,6 +123,7 @@ impl Default for MohrApp {
             project_message_is_error: false,
             confirm_clear: false,
             table_editor: TableEditor::default(),
+            property_editor: PropertyEditor::default(),
             legacy_frame: Frame::default(),
         }
     }
@@ -137,6 +144,8 @@ impl MohrApp {
         {
             app.model = migrate_legacy_frame(std::mem::take(&mut app.legacy_frame));
         }
+        app.model
+            .ensure_property_presets(app.rigidity, app.thermal_expansion);
         app.project_name = sanitize_project_name_input(&app.project_name);
         if app.project_name.trim().is_empty() {
             app.project_name = default_project_name();
@@ -215,8 +224,11 @@ impl MohrApp {
                 self.project_path = Some(loaded.path.clone());
                 self.model = loaded.data.model;
                 self.table_editor.close();
+                self.property_editor.close();
                 self.rigidity = loaded.data.rigidity;
                 self.thermal_expansion = loaded.data.thermal_expansion;
+                self.model
+                    .ensure_property_presets(self.rigidity, self.thermal_expansion);
                 self.effects = loaded.data.effects;
                 self.show_values = loaded.data.show_values;
                 self.canvas_view = loaded.data.view_state;
@@ -292,6 +304,7 @@ impl MohrApp {
 
     fn clear_workspace(&mut self) {
         self.table_editor.close();
+        self.property_editor.close();
         self.model = StructuralModel::default();
         self.rigidity = Rigidity::Symbolic;
         self.thermal_expansion = ThermalExpansion::Symbolic;
@@ -307,6 +320,7 @@ impl MohrApp {
     }
 
     fn show_top_toolbar(&mut self, root_ui: &mut egui::Ui) {
+        let editor_open = self.table_editor.open || self.property_editor.open;
         egui::Panel::top("project_toolbar").show(root_ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(
@@ -345,21 +359,21 @@ impl MohrApp {
                     self.project_path = None;
                 }
                 ui.monospace(".mohr.ron");
-                if ui.add_enabled(!self.table_editor.open, egui::Button::new("Сохранить")).clicked() {
+                if ui.add_enabled(!editor_open, egui::Button::new("Сохранить")).clicked() {
                     self.save_project_file();
                 }
                 if ui
-                    .add_enabled(!self.table_editor.open, egui::Button::new("Открыть…"))
+                    .add_enabled(!editor_open, egui::Button::new("Открыть…"))
                     .on_hover_text("Выбрать файл проекта *.mohr.ron в Finder или Проводнике")
                     .clicked()
                 {
                     self.open_project_file();
                 }
-                if ui.add_enabled(!self.table_editor.open, egui::Button::new("Экспорт Word")).clicked() {
+                if ui.add_enabled(!editor_open, egui::Button::new("Экспорт Word")).clicked() {
                     self.export_word_report();
                 }
                 if ui
-                    .add_enabled(!self.table_editor.open, egui::Button::new("Экспорт v0.5.0"))
+                    .add_enabled(!editor_open, egui::Button::new("Экспорт v0.5.0"))
                     .on_hover_text(
                         "Создать отдельную копию без mφ и масштаба холста, которую откроет v0.5.0",
                     )
@@ -368,7 +382,7 @@ impl MohrApp {
                     self.export_legacy_project();
                 }
                 if ui
-                    .add_enabled(!self.table_editor.open,
+                    .add_enabled(!editor_open,
                         egui::Button::new(
                             RichText::new("Очистить схему").color(Color32::from_rgb(255, 225, 225)),
                         )
@@ -509,7 +523,10 @@ impl MohrApp {
         let Some(id) = self.model.unique_rod_id(start_node, end_node) else {
             return;
         };
-        self.model.rods.push(Rod::blank(id, start_node, end_node));
+        let mut rod = Rod::blank(id, start_node, end_node);
+        rod.rigidity_preset_id = self.model.rigidity_presets.first().map(|item| item.id);
+        rod.thermal_preset_id = self.model.thermal_presets.first().map(|item| item.id);
+        self.model.rods.push(rod);
         self.selected_rod = self.model.rods.len() - 1;
     }
 
@@ -526,17 +543,15 @@ impl MohrApp {
             .default_size(410.0)
             .size_range(360.0..=560.0)
             .show(root_ui, |ui| {
-                if self.table_editor.open {
-                    ui.label("Табличное задание открыто. Изменения применяются кнопкой «Применить» в отдельном окне.");
+                if self.table_editor.open || self.property_editor.open {
+                    ui.label("Табличное окно открыто. Изменения применяются кнопкой «Применить».");
                     return;
                 }
                 ui.heading("Узловая модель рамы");
                 ui.small("Сначала задайте точки, затем соедините их стержнями");
                 ui.separator();
-                if tab == WorkspaceTab::ThermalDisplacement {
-                    thermal_expansion_editor(ui, &mut self.thermal_expansion);
-                } else {
-                    rigidity_editor(ui, &mut self.rigidity);
+                if ui.button("Таблица жёсткостей и коэффициентов α…").clicked() {
+                    self.property_editor.open_with(&self.model);
                 }
                 ui.separator();
 
@@ -677,7 +692,15 @@ impl MohrApp {
 
         let nodes = &self.model.nodes;
         if let Some(rod) = self.model.rods.get_mut(self.selected_rod) {
-            rod_editor(ui, rod, nodes, self.selected_rod, tab);
+            rod_editor(
+                ui,
+                rod,
+                nodes,
+                &self.model.rigidity_presets,
+                &self.model.thermal_presets,
+                self.selected_rod,
+                tab,
+            );
         } else {
             ui.colored_label(Color32::YELLOW, "Добавьте стержень между двумя точками");
         }
@@ -904,7 +927,7 @@ impl MohrApp {
     }
 
     fn show_kinematic_panel(&mut self, root_ui: &mut egui::Ui) {
-        if self.table_editor.open {
+        if self.table_editor.open || self.property_editor.open {
             egui::CentralPanel::default().show(root_ui, |ui| {
                 ui.label("Завершите табличное задание точек и стержней.");
             });
@@ -1089,6 +1112,12 @@ impl eframe::App for MohrApp {
             self.project_message = "Точки и стержни обновлены из таблицы".into();
             self.project_message_is_error = false;
         }
+        if let Some(model) = self.property_editor.show(ui.ctx()) {
+            self.model = model;
+            self.clamp_selection();
+            self.project_message = "Свойства стержней обновлены из таблицы".into();
+            self.project_message_is_error = false;
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1157,18 +1186,18 @@ fn result_header(ui: &mut egui::Ui, model: &StructuralModel, rigidity: Rigidity)
                     });
                     ui.horizontal_wrapped(|ui| {
                         ui.small(format!(
-                            "X: Σ∫Mp·mx dx = {}",
-                            format_number(result.horizontal.numerator)
+                            "X: Σ∫Mp·mx/EIᵢ dx = {}",
+                            result.horizontal.formatted_displacement()
                         ));
                         ui.separator();
                         ui.small(format!(
-                            "Y: Σ∫Mp·my dx = {}",
-                            format_number(result.vertical.numerator)
+                            "Y: Σ∫Mp·my/EIᵢ dx = {}",
+                            result.vertical.formatted_displacement()
                         ));
                         ui.separator();
                         ui.small(format!(
-                            "φ: Σ∫Mp·mφ dx = {}",
-                            format_number(result.rotation.numerator)
+                            "φ: Σ∫Mp·mφ/EIᵢ dx = {}",
+                            result.rotation.formatted_displacement()
                         ));
                     });
                     ui.horizontal_wrapped(|ui| {
@@ -1178,8 +1207,11 @@ fn result_header(ui: &mut egui::Ui, model: &StructuralModel, rigidity: Rigidity)
                                 "{}: {}/{} = {}",
                                 item.segment_id,
                                 format_number(item.raw_integral),
-                                format_number(item.rigidity_factor),
-                                format_number(item.integral)
+                                item.property.map_or_else(
+                                    || format!("{}·EI", format_number(item.rigidity_factor)),
+                                    |value| value.formatted("EI")
+                                ),
+                                force_item_text(item)
                             ));
                         }
                         ui.separator();
@@ -1189,8 +1221,11 @@ fn result_header(ui: &mut egui::Ui, model: &StructuralModel, rigidity: Rigidity)
                                 "{}: {}/{} = {}",
                                 item.segment_id,
                                 format_number(item.raw_integral),
-                                format_number(item.rigidity_factor),
-                                format_number(item.integral)
+                                item.property.map_or_else(
+                                    || format!("{}·EI", format_number(item.rigidity_factor)),
+                                    |value| value.formatted("EI")
+                                ),
+                                force_item_text(item)
                             ));
                         }
                     });
@@ -1201,8 +1236,11 @@ fn result_header(ui: &mut egui::Ui, model: &StructuralModel, rigidity: Rigidity)
                                 "{}: {}/{} = {}",
                                 item.segment_id,
                                 format_number(item.raw_integral),
-                                format_number(item.rigidity_factor),
-                                format_number(item.integral)
+                                item.property.map_or_else(
+                                    || format!("{}·EI", format_number(item.rigidity_factor)),
+                                    |value| value.formatted("EI")
+                                ),
+                                force_item_text(item)
                             ));
                         }
                     });
@@ -1212,6 +1250,20 @@ fn result_header(ui: &mut egui::Ui, model: &StructuralModel, rigidity: Rigidity)
                 }
             }
         });
+}
+
+fn force_item_text(item: &mohr_frame::SegmentContribution) -> String {
+    match item.property {
+        Some(value) if value.numeric => format_number(item.integral),
+        _ => format!("{} / EI", format_number(item.integral)),
+    }
+}
+
+fn thermal_item_text(item: &mohr_frame::ThermalRodContribution) -> String {
+    match item.property {
+        Some(value) if value.numeric => format_number(item.coefficient),
+        _ => format!("α · {}", format_number(item.coefficient)),
+    }
 }
 
 fn thermal_result_header(ui: &mut egui::Ui, model: &StructuralModel, expansion: ThermalExpansion) {
@@ -1230,7 +1282,7 @@ fn thermal_result_header(ui: &mut egui::Ui, model: &StructuralModel, expansion: 
                         thermal_value_label(ui, "φ(T)", &result.rotation, Color32::from_rgb(255, 210, 115));
                     });
                     ui.small(
-                        "Формула: α·Σkα·[sₜ·t′/h · ∫m ds + t₀ · ∫n ds], где t′ = |t₁−t₂|, а sₜ — знак стороны наиболее нагретых волокон.",
+                        "Формула: Σαᵢ·[sₜ·t′/h · ∫m ds + t₀ · ∫n ds], где t′ = |t₁−t₂|, а sₜ — знак стороны наиболее нагретых волокон.",
                     );
                     for (name, component) in [
                         ("X", &result.horizontal),
@@ -1243,10 +1295,10 @@ fn thermal_result_header(ui: &mut egui::Ui, model: &StructuralModel, expansion: 
                                 ui.small(format!(
                                     "{}: {}·({} + {}) = {}{}",
                                     item.rod_id,
-                                    format_number(item.expansion_factor),
+                                    item.property.map_or_else(|| format!("{}·α", format_number(item.expansion_factor)), |value| value.formatted("α")),
                                     format_number(item.bending_term),
                                     format_number(item.axial_term),
-                                    format_number(item.coefficient),
+                                    thermal_item_text(item),
                                     if item.active { "" } else { " (температура выключена)" }
                                 ));
                             }
@@ -1284,53 +1336,12 @@ fn displacement_views(result: &CalculationResult) -> String {
     }
 }
 
-fn rigidity_editor(ui: &mut egui::Ui, rigidity: &mut Rigidity) {
-    ui.strong("Жёсткость EI");
-    let numeric = matches!(rigidity, Rigidity::Numeric(_));
-    ui.horizontal(|ui| {
-        if ui.radio(!numeric, "Аналитическая").clicked() {
-            *rigidity = Rigidity::Symbolic;
-        }
-        if ui.radio(numeric, "Числом").clicked() && !numeric {
-            *rigidity = Rigidity::Numeric(1.0);
-        }
-        if let Rigidity::Numeric(value) = rigidity {
-            ui.add(
-                DragValue::new(value)
-                    .range(1.0e-12..=1.0e30)
-                    .speed(1.0)
-                    .prefix("EI = "),
-            );
-        }
-    });
-}
-
-fn thermal_expansion_editor(ui: &mut egui::Ui, expansion: &mut ThermalExpansion) {
-    ui.strong("Коэффициент линейного расширения α");
-    let numeric = matches!(expansion, ThermalExpansion::Numeric(_));
-    ui.horizontal(|ui| {
-        if ui.radio(!numeric, "Аналитический").clicked() {
-            *expansion = ThermalExpansion::Symbolic;
-        }
-        if ui.radio(numeric, "Числом").clicked() && !numeric {
-            *expansion = ThermalExpansion::Numeric(0.000012);
-        }
-        if let ThermalExpansion::Numeric(value) = expansion {
-            ui.add(
-                DragValue::new(value)
-                    .range(1.0e-15..=1.0)
-                    .speed(0.000001)
-                    .prefix("α = ")
-                    .suffix(" 1/°C"),
-            );
-        }
-    });
-}
-
 fn rod_editor(
     ui: &mut egui::Ui,
     rod: &mut Rod,
     nodes: &[Node],
+    rigidity_presets: &[PropertyPreset],
+    thermal_presets: &[PropertyPreset],
     unique_id: usize,
     tab: WorkspaceTab,
 ) {
@@ -1350,29 +1361,45 @@ fn rod_editor(
             format_number(length),
             orientation
         ));
-        if tab == WorkspaceTab::ThermalDisplacement {
-            ui.horizontal(|ui| {
-                ui.label("Коэффициент расширения стержня:");
-                ui.add(
-                    DragValue::new(&mut rod.thermal_expansion_factor)
-                        .range(1.0e-12..=1.0e12)
-                        .speed(0.1)
-                        .prefix("α участка = ")
-                        .suffix(" · α"),
-                );
-            });
+        let presets = if tab == WorkspaceTab::ThermalDisplacement {
+            thermal_presets
         } else {
-            ui.horizontal(|ui| {
-                ui.label("Жёсткость стержня:");
-                ui.add(
-                    DragValue::new(&mut rod.rigidity_factor)
-                        .range(1.0e-12..=1.0e12)
-                        .speed(0.1)
-                        .prefix("EI участка = ")
-                        .suffix(" · EI"),
-                );
+            rigidity_presets
+        };
+        let selected = if tab == WorkspaceTab::ThermalDisplacement {
+            &mut rod.thermal_preset_id
+        } else {
+            &mut rod.rigidity_preset_id
+        };
+        let label = selected.and_then(|id| presets.iter().find(|item| item.id == id));
+        ui.horizontal(|ui| {
+            ui.label(if tab == WorkspaceTab::ThermalDisplacement {
+                "Коэффициент α:"
+            } else {
+                "Жёсткость EI:"
             });
-        }
+            ComboBox::from_id_salt((
+                "rod_property",
+                unique_id,
+                tab == WorkspaceTab::ThermalDisplacement,
+            ))
+            .selected_text(label.map_or("—", |item| item.name.as_str()))
+            .show_ui(ui, |ui| {
+                for item in presets {
+                    ui.selectable_value(selected, Some(item.id), &item.name);
+                }
+            });
+            if let Some(item) = label {
+                ui.small(
+                    item.value
+                        .formatted(if tab == WorkspaceTab::ThermalDisplacement {
+                            "α"
+                        } else {
+                            "EI"
+                        }),
+                );
+            }
+        });
         if length <= 1.0e-9 {
             ui.colored_label(Color32::LIGHT_RED, "Начало и конец стержня совпадают");
         }
@@ -1705,6 +1732,8 @@ fn default_model() -> StructuralModel {
             id: "AB".into(),
             start_node: 0,
             end_node: 1,
+            rigidity_preset_id: None,
+            thermal_preset_id: None,
             rigidity_factor: 1.0,
             section_height: 0.5,
             thermal_expansion_factor: 1.0,
@@ -1720,6 +1749,8 @@ fn default_model() -> StructuralModel {
             unit_normal_rotation_diagram: zero_diagram(),
         }],
         target_node: 1,
+        rigidity_presets: Vec::new(),
+        thermal_presets: Vec::new(),
         supports: Vec::new(),
     }
 }
@@ -1737,6 +1768,8 @@ fn migrate_legacy_frame(frame: Frame) -> StructuralModel {
             id: segment.id,
             start_node,
             end_node,
+            rigidity_preset_id: None,
+            thermal_preset_id: None,
             rigidity_factor: segment.rigidity_factor,
             section_height: 0.5,
             thermal_expansion_factor: 1.0,
@@ -1754,6 +1787,8 @@ fn migrate_legacy_frame(frame: Frame) -> StructuralModel {
     }
     StructuralModel {
         target_node: nodes.len().saturating_sub(1).min(1),
+        rigidity_presets: Vec::new(),
+        thermal_presets: Vec::new(),
         supports: Vec::new(),
         nodes,
         rods,

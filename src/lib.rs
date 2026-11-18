@@ -21,6 +21,95 @@ fn default_thermal_expansion_factor() -> f64 {
     1.0
 }
 
+/// Значение строки справочника: коэффициент перед символом либо полное число.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PropertyValue {
+    pub numeric: bool,
+    pub symbolic_factor: f64,
+    pub mantissa: f64,
+    pub exponent: i32,
+}
+
+impl Default for PropertyValue {
+    fn default() -> Self {
+        Self {
+            numeric: false,
+            symbolic_factor: 1.0,
+            mantissa: 1.0,
+            exponent: 0,
+        }
+    }
+}
+
+impl PropertyValue {
+    pub fn from_number(value: f64) -> Self {
+        if !value.is_finite() || value <= 0.0 {
+            return Self {
+                numeric: true,
+                mantissa: value,
+                ..Self::default()
+            };
+        }
+        let exponent = value.log10().floor() as i32;
+        let scale = 10_f64.powi(exponent);
+        let (mantissa, exponent) = if scale.is_finite() && scale > 0.0 {
+            (value / scale, exponent)
+        } else {
+            (value, 0)
+        };
+        Self {
+            numeric: true,
+            mantissa,
+            exponent,
+            ..Self::default()
+        }
+    }
+
+    pub fn numeric_value(self) -> Option<f64> {
+        let value = self.mantissa * 10_f64.powi(self.exponent);
+        (value.is_finite() && value > 0.0).then_some(value)
+    }
+
+    pub fn validate(self) -> Result<(), String> {
+        if !self.numeric && (!self.symbolic_factor.is_finite() || self.symbolic_factor <= 0.0) {
+            return Err("аналитический коэффициент должен быть положительным числом".into());
+        }
+        if self.numeric && self.numeric_value().is_none() {
+            return Err("числовое значение должно быть положительным конечным числом".into());
+        }
+        Ok(())
+    }
+
+    pub fn formatted(self, symbol: &str) -> String {
+        if self.numeric {
+            format!("{} × 10^({})", format_number(self.mantissa), self.exponent)
+        } else {
+            format!("{} · {symbol}", format_number(self.symbolic_factor))
+        }
+    }
+}
+
+/// Идентификатор не меняется при переименовании строки справочника.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PropertyPreset {
+    pub id: u32,
+    pub name: String,
+    pub value: PropertyValue,
+}
+
+fn preset_id_for_value(items: &mut Vec<PropertyPreset>, value: PropertyValue, prefix: &str) -> u32 {
+    if let Some(existing) = items.iter().find(|item| item.value == value) {
+        return existing.id;
+    }
+    let id = items.iter().map(|item| item.id).max().unwrap_or(0) + 1;
+    items.push(PropertyPreset {
+        id,
+        name: format!("{prefix} {id}"),
+        value,
+    });
+    id
+}
+
 /// Точка в глобальной декартовой системе координат.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
@@ -425,6 +514,10 @@ pub struct Rod {
     pub id: String,
     pub start_node: usize,
     pub end_node: usize,
+    #[serde(default)]
+    pub rigidity_preset_id: Option<u32>,
+    #[serde(default)]
+    pub thermal_preset_id: Option<u32>,
     /// Коэффициент жесткости стержня относительно базового EI.
     #[serde(default = "default_rigidity_factor")]
     pub rigidity_factor: f64,
@@ -467,6 +560,8 @@ impl Rod {
             id,
             start_node,
             end_node,
+            rigidity_preset_id: None,
+            thermal_preset_id: None,
             rigidity_factor: 1.0,
             section_height: 0.5,
             thermal_expansion_factor: 1.0,
@@ -622,6 +717,10 @@ pub struct StructuralModel {
     pub rods: Vec<Rod>,
     pub target_node: usize,
     #[serde(default)]
+    pub rigidity_presets: Vec<PropertyPreset>,
+    #[serde(default)]
+    pub thermal_presets: Vec<PropertyPreset>,
+    #[serde(default)]
     pub supports: Vec<SupportMotion>,
 }
 
@@ -704,6 +803,32 @@ impl StructuralModel {
         }
         if self.target_node >= self.nodes.len() {
             return Err("не выбрана корректная точка для определения перемещений".into());
+        }
+        for (kind, presets) in [
+            ("жёсткости", &self.rigidity_presets),
+            ("коэффициента α", &self.thermal_presets),
+        ] {
+            for (index, preset) in presets.iter().enumerate() {
+                if preset.name.trim().is_empty() {
+                    return Err(format!("строка {kind} {}: задайте название", index + 1));
+                }
+                if presets[..index].iter().any(|previous| {
+                    previous.id == preset.id
+                        || previous
+                            .name
+                            .trim()
+                            .eq_ignore_ascii_case(preset.name.trim())
+                }) {
+                    return Err(format!(
+                        "строка {kind} '{}': повторяется ID или название",
+                        preset.name
+                    ));
+                }
+                preset
+                    .value
+                    .validate()
+                    .map_err(|error| format!("строка {kind} '{}': {error}", preset.name))?;
+            }
         }
         for (index, node) in self.nodes.iter().enumerate() {
             if node.id.trim().is_empty() {
@@ -788,6 +913,24 @@ impl StructuralModel {
                     rod.id
                 ));
             }
+            if rod
+                .rigidity_preset_id
+                .is_some_and(|id| !self.rigidity_presets.iter().any(|item| item.id == id))
+            {
+                return Err(format!(
+                    "стержень {}: выбранная жёсткость не найдена",
+                    rod.id
+                ));
+            }
+            if rod
+                .thermal_preset_id
+                .is_some_and(|id| !self.thermal_presets.iter().any(|item| item.id == id))
+            {
+                return Err(format!(
+                    "стержень {}: выбранный коэффициент α не найден",
+                    rod.id
+                ));
+            }
             if let Some(temperature) = rod.temperature {
                 if !temperature.upper_or_left.is_finite() || !temperature.lower_or_right.is_finite()
                 {
@@ -869,6 +1012,93 @@ impl StructuralModel {
                 rod.id = suffix.map_or(new_base.clone(), |part| format!("{new_base}-{part}"));
             }
         }
+    }
+
+    pub fn ensure_property_presets(&mut self, rigidity: Rigidity, expansion: ThermalExpansion) {
+        for rod in &mut self.rods {
+            if rod.rigidity_preset_id.is_none() {
+                let value = match rigidity {
+                    Rigidity::Symbolic => PropertyValue {
+                        symbolic_factor: rod.rigidity_factor,
+                        ..PropertyValue::default()
+                    },
+                    Rigidity::Numeric(base) => {
+                        PropertyValue::from_number(base * rod.rigidity_factor)
+                    }
+                };
+                let id = preset_id_for_value(&mut self.rigidity_presets, value, "Жёсткость");
+                rod.rigidity_preset_id = Some(id);
+            }
+            if rod.thermal_preset_id.is_none() {
+                let value = match expansion {
+                    ThermalExpansion::Symbolic => PropertyValue {
+                        symbolic_factor: rod.thermal_expansion_factor,
+                        ..PropertyValue::default()
+                    },
+                    ThermalExpansion::Numeric(base) => {
+                        PropertyValue::from_number(base * rod.thermal_expansion_factor)
+                    }
+                };
+                let id = preset_id_for_value(&mut self.thermal_presets, value, "Расширение");
+                rod.thermal_preset_id = Some(id);
+            }
+        }
+        if self.rigidity_presets.is_empty() {
+            self.rigidity_presets.push(PropertyPreset {
+                id: 1,
+                name: "Жёсткость 1".into(),
+                value: PropertyValue::default(),
+            });
+        }
+        if self.thermal_presets.is_empty() {
+            self.thermal_presets.push(PropertyPreset {
+                id: 1,
+                name: "Расширение 1".into(),
+                value: PropertyValue::default(),
+            });
+        }
+    }
+
+    pub fn rigidity_value(&self, rod: &Rod, legacy: Rigidity) -> Result<PropertyValue, String> {
+        if let Some(id) = rod.rigidity_preset_id {
+            return self
+                .rigidity_presets
+                .iter()
+                .find(|item| item.id == id)
+                .map(|item| item.value)
+                .ok_or_else(|| format!("стержень {}: жёсткость не найдена", rod.id));
+        }
+        Ok(match legacy {
+            Rigidity::Symbolic => PropertyValue {
+                symbolic_factor: rod.rigidity_factor,
+                ..PropertyValue::default()
+            },
+            Rigidity::Numeric(base) => PropertyValue::from_number(base * rod.rigidity_factor),
+        })
+    }
+
+    pub fn thermal_value(
+        &self,
+        rod: &Rod,
+        legacy: ThermalExpansion,
+    ) -> Result<PropertyValue, String> {
+        if let Some(id) = rod.thermal_preset_id {
+            return self
+                .thermal_presets
+                .iter()
+                .find(|item| item.id == id)
+                .map(|item| item.value)
+                .ok_or_else(|| format!("стержень {}: коэффициент α не найден", rod.id));
+        }
+        Ok(match legacy {
+            ThermalExpansion::Symbolic => PropertyValue {
+                symbolic_factor: rod.thermal_expansion_factor,
+                ..PropertyValue::default()
+            },
+            ThermalExpansion::Numeric(base) => {
+                PropertyValue::from_number(base * rod.thermal_expansion_factor)
+            }
+        })
     }
 
     pub fn rod_length(&self, rod: &Rod) -> Result<f64, String> {
@@ -1017,6 +1247,7 @@ pub struct SegmentContribution {
     pub raw_integral: f64,
     /// Коэффициент k в выражении EI участка = k * EI базы.
     pub rigidity_factor: f64,
+    pub property: Option<PropertyValue>,
     /// Эквивалентный вклад в числитель: raw_integral / rigidity_factor.
     pub integral: f64,
     pub method: IntegrationMethod,
@@ -1029,6 +1260,7 @@ pub struct CalculationResult {
     pub contributions: Vec<SegmentContribution>,
     /// Сумма интегралов ∫Mp·m1 dx до деления на EI.
     pub numerator: f64,
+    pub numeric_part: f64,
     pub rigidity: Rigidity,
 }
 
@@ -1048,6 +1280,7 @@ pub struct ThermalRodContribution {
     pub length: f64,
     pub section_height: f64,
     pub expansion_factor: f64,
+    pub property: Option<PropertyValue>,
     pub upper_or_left: f64,
     pub lower_or_right: f64,
     pub temperature_difference: f64,
@@ -1066,6 +1299,7 @@ pub struct ThermalCalculationResult {
     pub contributions: Vec<ThermalRodContribution>,
     /// Коэффициент при α либо величина до умножения на числовое α.
     pub coefficient: f64,
+    pub numeric_part: f64,
     pub expansion: ThermalExpansion,
 }
 
@@ -1079,7 +1313,8 @@ pub struct ThermalDisplacementComponents {
 impl ThermalCalculationResult {
     pub fn numeric_displacement(&self) -> Option<f64> {
         match self.expansion {
-            ThermalExpansion::Numeric(alpha) => Some(alpha * self.coefficient),
+            ThermalExpansion::Numeric(alpha) => Some(alpha * self.coefficient + self.numeric_part),
+            ThermalExpansion::Symbolic if self.coefficient.abs() <= EPS => Some(self.numeric_part),
             ThermalExpansion::Symbolic => None,
         }
     }
@@ -1088,7 +1323,10 @@ impl ThermalCalculationResult {
         match self.numeric_displacement() {
             Some(value) => format_number(value),
             None if self.coefficient.abs() <= EPS => "0".into(),
-            None => format!("α · {}", format_number(self.coefficient)),
+            None => join_expression(
+                format!("α · {}", format_number(self.coefficient)),
+                self.numeric_part,
+            ),
         }
     }
 }
@@ -1096,7 +1334,8 @@ impl ThermalCalculationResult {
 impl CalculationResult {
     pub fn numeric_displacement(&self) -> Option<f64> {
         match self.rigidity {
-            Rigidity::Numeric(ei) => Some(self.numerator / ei),
+            Rigidity::Numeric(ei) => Some(self.numerator / ei + self.numeric_part),
+            Rigidity::Symbolic if self.numerator.abs() <= EPS => Some(self.numeric_part),
             Rigidity::Symbolic => None,
         }
     }
@@ -1104,7 +1343,10 @@ impl CalculationResult {
     pub fn formatted_displacement(&self) -> String {
         match self.numeric_displacement() {
             Some(value) => format_number(value),
-            None => format_symbolic_displacement(self.numerator),
+            None => join_expression(
+                format_symbolic_displacement(self.numerator),
+                self.numeric_part,
+            ),
         }
     }
 
@@ -1112,8 +1354,21 @@ impl CalculationResult {
     pub fn formatted_decimal_displacement(&self) -> String {
         match self.numeric_displacement() {
             Some(value) => format_number(value),
-            None => format!("{} / EI", format_number(self.numerator)),
+            None => join_expression(
+                format!("{} / EI", format_number(self.numerator)),
+                self.numeric_part,
+            ),
         }
+    }
+}
+
+fn join_expression(symbolic: String, numeric: f64) -> String {
+    if numeric.abs() <= EPS {
+        symbolic
+    } else if numeric < 0.0 {
+        format!("{symbolic} - {}", format_number(-numeric))
+    } else {
+        format!("{symbolic} + {}", format_number(numeric))
     }
 }
 
@@ -1127,6 +1382,10 @@ fn format_symbolic_displacement(value: f64) -> String {
         return format!("{sixths} / 6EI");
     }
     format!("{} / EI", format_number(value))
+}
+
+pub fn format_symbolic_force(value: f64) -> String {
+    format_symbolic_displacement(value)
 }
 
 fn nearly_integer(value: f64) -> Option<String> {
@@ -1176,6 +1435,7 @@ pub fn calculate_displacement(
             segment_id: segment.id.clone(),
             raw_integral,
             rigidity_factor: segment.rigidity_factor,
+            property: None,
             integral,
             method,
             load_values: [mp_left, mp_mid, mp_right],
@@ -1187,6 +1447,7 @@ pub fn calculate_displacement(
     Ok(CalculationResult {
         contributions,
         numerator,
+        numeric_part: 0.0,
         rigidity,
     })
 }
@@ -1199,10 +1460,36 @@ pub fn calculate_displacement_components(
     let horizontal_frame = model.frame_for(DisplacementDirection::Horizontal)?;
     let vertical_frame = model.frame_for(DisplacementDirection::Vertical)?;
     let rotation_frame = model.frame_for(DisplacementDirection::Rotation)?;
+    let calculate = |frame: &Frame| -> Result<CalculationResult, String> {
+        let mut result = calculate_displacement(frame, rigidity)?;
+        if model
+            .rods
+            .iter()
+            .any(|rod| rod.rigidity_preset_id.is_some())
+        {
+            result.rigidity = Rigidity::Symbolic;
+            result.numerator = 0.0;
+            for (item, rod) in result.contributions.iter_mut().zip(&model.rods) {
+                let property = model.rigidity_value(rod, rigidity)?;
+                item.property = Some(property);
+                if property.numeric {
+                    item.integral = item.raw_integral
+                        / property
+                            .numeric_value()
+                            .ok_or("некорректная числовая жёсткость")?;
+                    result.numeric_part += item.integral;
+                } else {
+                    item.integral = item.raw_integral / property.symbolic_factor;
+                    result.numerator += item.integral;
+                }
+            }
+        }
+        Ok(result)
+    };
     Ok(DisplacementComponents {
-        horizontal: calculate_displacement(&horizontal_frame, rigidity)?,
-        vertical: calculate_displacement(&vertical_frame, rigidity)?,
-        rotation: calculate_displacement(&rotation_frame, rigidity)?,
+        horizontal: calculate(&horizontal_frame)?,
+        vertical: calculate(&vertical_frame)?,
+        rotation: calculate(&rotation_frame)?,
     })
 }
 
@@ -1235,6 +1522,9 @@ fn calculate_thermal_direction(
     direction: DisplacementDirection,
 ) -> Result<ThermalCalculationResult, String> {
     let mut contributions = Vec::with_capacity(model.rods.len());
+    let has_presets = model.rods.iter().any(|rod| rod.thermal_preset_id.is_some());
+    let mut symbolic_coefficient = 0.0;
+    let mut numeric_part = 0.0;
     for rod in &model.rods {
         let length = model.rod_length(rod)?;
         let moment = match direction {
@@ -1261,12 +1551,35 @@ fn calculate_thermal_direction(
             0.0
         };
         let axial_term = if active { mean * normal_area } else { 0.0 };
+        let base_term = bending_term + axial_term;
+        let property = if has_presets {
+            Some(model.thermal_value(rod, expansion)?)
+        } else {
+            None
+        };
+        let contribution = if let Some(property) = property {
+            if property.numeric {
+                let value = base_term
+                    * property
+                        .numeric_value()
+                        .ok_or("некорректный числовой коэффициент α")?;
+                numeric_part += value;
+                value
+            } else {
+                let value = base_term * property.symbolic_factor;
+                symbolic_coefficient += value;
+                value
+            }
+        } else {
+            rod.thermal_expansion_factor * base_term
+        };
         contributions.push(ThermalRodContribution {
             rod_id: rod.id.clone(),
             active,
             length,
             section_height: rod.section_height,
             expansion_factor: rod.thermal_expansion_factor,
+            property,
             upper_or_left: temperature.upper_or_left,
             lower_or_right: temperature.lower_or_right,
             temperature_difference: difference,
@@ -1277,14 +1590,23 @@ fn calculate_thermal_direction(
             unit_normal_area: normal_area,
             bending_term,
             axial_term,
-            coefficient: rod.thermal_expansion_factor * (bending_term + axial_term),
+            coefficient: contribution,
         });
     }
-    let coefficient = contributions.iter().map(|item| item.coefficient).sum();
+    let coefficient = if has_presets {
+        symbolic_coefficient
+    } else {
+        contributions.iter().map(|item| item.coefficient).sum()
+    };
     Ok(ThermalCalculationResult {
         contributions,
         coefficient,
-        expansion,
+        numeric_part,
+        expansion: if has_presets {
+            ThermalExpansion::Symbolic
+        } else {
+            expansion
+        },
     })
 }
 
@@ -1476,6 +1798,7 @@ mod tests {
         let result = CalculationResult {
             contributions: Vec::new(),
             numerator: 310.0 / 6.0,
+            numeric_part: 0.0,
             rigidity: Rigidity::Symbolic,
         };
         assert_eq!(result.formatted_displacement(), "310 / 6EI");
@@ -1515,6 +1838,8 @@ mod tests {
                 id: "AB".into(),
                 start_node: 0,
                 end_node: 1,
+                rigidity_preset_id: None,
+                thermal_preset_id: None,
                 rigidity_factor: 1.0,
                 section_height: 0.5,
                 thermal_expansion_factor: 1.0,
@@ -1530,6 +1855,8 @@ mod tests {
                 unit_normal_rotation_diagram: Diagram::default(),
             }],
             target_node: 1,
+            rigidity_presets: Vec::new(),
+            thermal_presets: Vec::new(),
             supports: Vec::new(),
         };
         assert!((model.rod_length(&model.rods[0]).unwrap() - 2.0).abs() < EPS);
@@ -1554,6 +1881,8 @@ mod tests {
             ],
             rods: vec![Rod::blank("AB".into(), 0, 1)],
             target_node: 1,
+            rigidity_presets: Vec::new(),
+            thermal_presets: Vec::new(),
             supports: vec![
                 SupportMotion {
                     node: 0,
@@ -1607,6 +1936,8 @@ mod tests {
             nodes: nodes.clone(),
             rods: vec![Rod::blank("AA-B".into(), 0, 1)],
             target_node: 0,
+            rigidity_presets: Vec::new(),
+            thermal_presets: Vec::new(),
             supports: Vec::new(),
         };
         let old = vec![("AA-B".into(), 0, 1)];
@@ -1649,6 +1980,8 @@ mod tests {
             ],
             rods: vec![Rod::blank("AB".into(), 0, 1)],
             target_node: 1,
+            rigidity_presets: Vec::new(),
+            thermal_presets: Vec::new(),
             supports: Vec::new(),
         };
         assert!(model
@@ -1718,6 +2051,8 @@ mod tests {
                 id: "AB".into(),
                 start_node: 0,
                 end_node: 1,
+                rigidity_preset_id: None,
+                thermal_preset_id: None,
                 rigidity_factor: 1.0,
                 section_height: 0.5,
                 thermal_expansion_factor: 2.0,
@@ -1736,6 +2071,8 @@ mod tests {
                 unit_normal_rotation_diagram: Diagram::default(),
             }],
             target_node: 1,
+            rigidity_presets: Vec::new(),
+            thermal_presets: Vec::new(),
             supports: Vec::new(),
         };
         let result =
@@ -1788,5 +2125,99 @@ mod tests {
                 .unwrap();
         assert!(disabled.horizontal.coefficient.abs() < EPS);
         assert_eq!(disabled.horizontal.formatted_displacement(), "0");
+    }
+
+    #[test]
+    fn independent_presets_mix_symbolic_and_numeric_force_and_temperature() {
+        let nodes = vec![
+            Node {
+                id: "A".into(),
+                position: Point { x: 0.0, y: 0.0 },
+            },
+            Node {
+                id: "B".into(),
+                position: Point { x: 2.0, y: 0.0 },
+            },
+            Node {
+                id: "C".into(),
+                position: Point { x: 4.0, y: 0.0 },
+            },
+        ];
+        let mut first = Rod::blank("AB".into(), 0, 1);
+        let mut second = Rod::blank("BC".into(), 1, 2);
+        for rod in [&mut first, &mut second] {
+            rod.load_diagram = linear(2.0, 2.0);
+            rod.unit_x_diagram = linear(3.0, 3.0);
+            rod.unit_normal_x_diagram = linear(1.0, 1.0);
+            rod.temperature = Some(TemperatureLoad {
+                upper_or_left: 10.0,
+                lower_or_right: 10.0,
+            });
+        }
+        first.rigidity_preset_id = Some(1);
+        first.thermal_preset_id = Some(1);
+        second.rigidity_preset_id = Some(2);
+        second.thermal_preset_id = Some(2);
+        let model = StructuralModel {
+            nodes,
+            rods: vec![first, second],
+            target_node: 2,
+            supports: vec![],
+            rigidity_presets: vec![
+                PropertyPreset {
+                    id: 1,
+                    name: "Первая".into(),
+                    value: PropertyValue {
+                        symbolic_factor: 6.0,
+                        ..PropertyValue::default()
+                    },
+                },
+                PropertyPreset {
+                    id: 2,
+                    name: "Вторая".into(),
+                    value: PropertyValue {
+                        numeric: true,
+                        mantissa: 2.0,
+                        exponent: 5,
+                        ..PropertyValue::default()
+                    },
+                },
+            ],
+            thermal_presets: vec![
+                PropertyPreset {
+                    id: 1,
+                    name: "Первый".into(),
+                    value: PropertyValue {
+                        symbolic_factor: 2.0,
+                        ..PropertyValue::default()
+                    },
+                },
+                PropertyPreset {
+                    id: 2,
+                    name: "Второй".into(),
+                    value: PropertyValue {
+                        numeric: true,
+                        mantissa: 1.0,
+                        exponent: -5,
+                        ..PropertyValue::default()
+                    },
+                },
+            ],
+        };
+        let force = calculate_displacement_components(&model, Rigidity::Symbolic).unwrap();
+        assert!((force.horizontal.numerator - 2.0).abs() < EPS);
+        assert!((force.horizontal.numeric_part - 0.00006).abs() < EPS);
+        assert_eq!(
+            force.horizontal.formatted_displacement(),
+            "2 / EI + 0.00006"
+        );
+        let thermal =
+            calculate_thermal_displacement_components(&model, ThermalExpansion::Symbolic).unwrap();
+        assert!((thermal.horizontal.coefficient - 40.0).abs() < EPS);
+        assert!((thermal.horizontal.numeric_part - 0.0002).abs() < EPS);
+        assert_eq!(
+            thermal.horizontal.formatted_displacement(),
+            "α · 40 + 0.0002"
+        );
     }
 }

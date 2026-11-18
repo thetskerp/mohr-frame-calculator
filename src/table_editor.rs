@@ -101,7 +101,10 @@ impl TableEditor {
                                         break;
                                     };
                                     let id = draft.unique_rod_id(start, end).expect("выбраны существующие точки");
-                                    draft.rods.push(Rod::blank(id, start, end));
+                                    let mut rod = Rod::blank(id, start, end);
+                                    rod.rigidity_preset_id = draft.rigidity_presets.first().map(|item| item.id);
+                                    rod.thermal_preset_id = draft.thermal_presets.first().map(|item| item.id);
+                                    draft.rods.push(rod);
                                 }
                             }
                         } else if rod_count < draft.rods.len() {

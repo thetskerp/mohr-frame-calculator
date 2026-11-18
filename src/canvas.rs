@@ -515,11 +515,14 @@ fn draw_temperatures(
             midpoint + unit * 3.0,
             Align2::CENTER_TOP,
             format!(
-                "t′={}; t₀={}; h={}; kα={}",
+                "t′={}; t₀={}; h={}; α={}",
                 format_number(temperature.difference()),
                 format_number(temperature.mean()),
                 format_number(rod.section_height),
-                format_number(rod.thermal_expansion_factor)
+                model
+                    .thermal_value(rod, mohr_frame::ThermalExpansion::Symbolic)
+                    .map(|value| value.formatted("α"))
+                    .unwrap_or_else(|_| "?".into())
             ),
             FontId::proportional(11.0),
             Color32::from_gray(205),
@@ -599,6 +602,8 @@ mod tests {
             ],
             rods: Vec::new(),
             target_node: 0,
+            rigidity_presets: Vec::new(),
+            thermal_presets: Vec::new(),
             supports: Vec::new(),
         }
     }

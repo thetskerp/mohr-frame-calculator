@@ -96,24 +96,27 @@ fn build_document_xml(
 
     body.push_str(&heading("Исходные данные", 1));
     if effects.force {
-        body.push_str(&paragraph(
-        &format!(
-            "Базовая изгибная жёсткость: {}. Для каждого стержня EI участка равно коэффициенту k, умноженному на базовое EI.",
-            xml_escape(&rigidity_text(rigidity))
-        ),
-        None,
-        false,
-    ));
+        let description = if model
+            .rods
+            .iter()
+            .any(|rod| rod.rigidity_preset_id.is_some())
+        {
+            "Жёсткости заданы независимо в таблице EI. Без отметки «Задано численно» строка содержит коэффициент перед EI; с отметкой — полное числовое значение.".to_string()
+        } else {
+            format!(
+                "Базовая изгибная жёсткость: {}. Жёсткость участка равна k·EI.",
+                rigidity_text(rigidity)
+            )
+        };
+        body.push_str(&paragraph(&description, None, false));
     }
     if effects.thermal {
-        body.push_str(&paragraph(
-        &format!(
-            "Базовый коэффициент температурного расширения: {}. Для стержня αᵢ = kα·α. Температурное слагаемое: α·Σkα·[sₜ·t′/h·∫m ds + t₀·∫n ds], где t′ = |t₁−t₂|, а sₜ — знак стороны наиболее нагретых волокон.",
-            xml_escape(&expansion_text(expansion))
-        ),
-        None,
-        false,
-    ));
+        let description = if model.rods.iter().any(|rod| rod.thermal_preset_id.is_some()) {
+            "Коэффициенты температурного расширения заданы независимо в таблице α. Без отметки «Задано численно» строка содержит коэффициент перед α; с отметкой — полное числовое значение. Для каждого стержня: αᵢ·[sₜ·t′/h·∫m ds + t₀·∫n ds], где t′ = |t₁−t₂|.".to_string()
+        } else {
+            format!("Базовый коэффициент температурного расширения: {}. Для стержня αᵢ = kα·α; t′ = |t₁−t₂|.", expansion_text(expansion))
+        };
+        body.push_str(&paragraph(&description, None, false));
     }
 
     let node_rows = model
@@ -150,12 +153,12 @@ fn build_document_xml(
             format_number(length),
         ];
         if effects.force {
-            row.push(format_number(rod.rigidity_factor));
+            row.push(model.rigidity_value(rod, rigidity)?.formatted("EI"));
         }
         if effects.thermal {
             row.extend([
                 format_number(rod.section_height),
-                format_number(rod.thermal_expansion_factor),
+                model.thermal_value(rod, expansion)?.formatted("α"),
                 if rod.temperature.is_some() {
                     format!(
                         "{}; {}",
@@ -178,10 +181,10 @@ fn build_document_xml(
     body.push_str(&caption("Таблица 2  Геометрия и параметры стержней"));
     let mut rod_headers = vec!["Стержень", "Узлы", "L"];
     if effects.force {
-        rod_headers.push("kEI");
+        rod_headers.push("EI стержня");
     }
     if effects.thermal {
-        rod_headers.extend(["h", "kα", "t₁; t₂"]);
+        rod_headers.extend(["h", "α стержня", "t₁; t₂"]);
     }
     body.push_str(&table(&rod_headers, &rod_rows));
     body.push_str(&caption("Таблица 3  Заданные эпюры M, N и Q"));
@@ -212,7 +215,7 @@ fn build_document_xml(
         body.push_str(&math_paragraph("Δx, Δy, φ = Σ ∫ Mₚ m₁ / (EIᵢ) dx"));
         body.push_str(empty_paragraph());
         body.push_str(&paragraph(
-        "На линейных и постоянных участках применяется аналитическое перемножение трапеций. Если хотя бы одна эпюра параболическая, используется трёхточечная формула Симпсона. Различие жёсткостей учитывается делением вклада участка на коэффициент k.",
+        "На линейных и постоянных участках применяется аналитическое перемножение трапеций. Если хотя бы одна эпюра параболическая, используется трёхточечная формула Симпсона. Вклад каждого стержня делится на его EI.",
         None,
         false,
     ));
@@ -240,7 +243,7 @@ fn build_document_xml(
         body.push_str(page_break());
         body.push_str(&heading("Расчёт температурных перемещений", 1));
         body.push_str(&math_paragraph(
-            "ΔT = α·Σ kα·[sₜ·t′·∫m ds/h + t₀·∫n ds],  t′=|t₁−t₂|",
+            "ΔT = Σ αᵢ·[sₜ·t′·∫m ds/h + t₀·∫n ds],  t′=|t₁−t₂|",
         ));
         body.push_str(&paragraph(
         if effects.thermal {
@@ -408,8 +411,11 @@ fn append_component(
                 triple(item.load_values),
                 triple(item.unit_values),
                 format_number(item.raw_integral),
-                format_number(item.rigidity_factor),
-                format_number(item.integral),
+                item.property.map_or_else(
+                    || format!("{} · EI", format_number(item.rigidity_factor)),
+                    |value| value.formatted("EI"),
+                ),
+                force_contribution_text(item),
             ]
         })
         .collect::<Vec<_>>();
@@ -423,7 +429,7 @@ fn append_component(
             "Mₚ  L; L/2; R",
             "m₁  L; L/2; R",
             "Интеграл",
-            "k",
+            "EI стержня",
             "Вклад",
         ],
         &rows,
@@ -443,23 +449,27 @@ fn append_component(
             integration_formula(item.method)
         )));
         body.push_str(&calculation_paragraph(&format!(
-            "Подстановка: {} = {} / {} = {}",
+            "Подстановка: I = {} = {}; I/EIᵢ = {} / {} = {}",
             substituted_integral(length, item),
             format_number(item.raw_integral),
-            format_number(item.rigidity_factor),
-            format_number(item.integral)
+            format_number(item.raw_integral),
+            item.property.map_or_else(
+                || format!("{} · EI", format_number(item.rigidity_factor)),
+                |value| value.formatted("EI")
+            ),
+            force_contribution_text(item)
         )));
     }
     let sum = result
         .contributions
         .iter()
-        .map(|item| format_number(item.integral))
+        .map(force_contribution_text)
         .collect::<Vec<_>>()
         .join(" + ");
     let sum = if sum.is_empty() { "0" } else { &sum };
     body.push_str(&calculation_paragraph(&format!(
-        "Сумма без сокращений: Σ(∫Mₚ·m₁ dx / k) = {sum} = {}",
-        format_number(result.numerator)
+        "Сумма без сокращений: Σ(∫Mₚ·m₁ dx / EIᵢ) = {sum} = {}",
+        result.formatted_displacement()
     )));
     body.push_str(empty_paragraph());
     body.push_str(&result_paragraph(&format!(
@@ -488,7 +498,10 @@ fn append_thermal_component(
                     "нет".into()
                 },
                 format_number(item.section_height),
-                format_number(item.expansion_factor),
+                item.property.map_or_else(
+                    || format!("{} · α", format_number(item.expansion_factor)),
+                    |value| value.formatted("α"),
+                ),
                 format!(
                     "{}; {}",
                     format_number(item.upper_or_left),
@@ -501,7 +514,7 @@ fn append_thermal_component(
                 ),
                 format_number(item.bending_term),
                 format_number(item.axial_term),
-                format_number(item.coefficient),
+                thermal_contribution_text(item),
             ]
         })
         .collect::<Vec<_>>();
@@ -513,7 +526,7 @@ fn append_thermal_component(
             "Стержень",
             "T",
             "h",
-            "kα",
+            "α стержня",
             "t₁; t₂",
             "t′; t₀",
             "Изгиб",
@@ -539,18 +552,24 @@ fn append_thermal_component(
             format_number(item.mean_temperature),
         )));
         body.push_str(&calculation_paragraph(&format!(
-            "α·{}·[{}·{}/{}·{} + {}·{}] = α·{}·[{} + {}] = α·{}{}",
-            format_number(item.expansion_factor),
+            "{}·[{}·{}/{}·{} + {}·{}] = {}·[{} + {}] = {}{}",
+            item.property.map_or_else(
+                || format!("{} · α", format_number(item.expansion_factor)),
+                |value| value.formatted("α")
+            ),
             format_number(item.hotter_side_sign),
             format_number(item.temperature_difference),
             format_number(item.section_height),
             format_number(item.unit_moment_area),
             format_number(item.mean_temperature),
             format_number(item.unit_normal_area),
-            format_number(item.expansion_factor),
+            item.property.map_or_else(
+                || format!("{} · α", format_number(item.expansion_factor)),
+                |value| value.formatted("α")
+            ),
             format_number(item.bending_term),
             format_number(item.axial_term),
-            format_number(item.coefficient),
+            thermal_contribution_text(item),
             if item.active {
                 ""
             } else {
@@ -561,11 +580,11 @@ fn append_thermal_component(
     let sum = result
         .contributions
         .iter()
-        .map(|item| format_number(item.coefficient))
+        .map(thermal_contribution_text)
         .collect::<Vec<_>>()
         .join(" + ");
     body.push_str(&calculation_paragraph(&format!(
-        "Сумма: α·({sum}) = {}",
+        "Сумма: {sum} = {}",
         result.formatted_displacement()
     )));
     body.push_str(&result_paragraph(&format!(
@@ -657,14 +676,20 @@ fn combined_value(
     }
     let mut terms = Vec::new();
     if effects.force && force_numeric.is_none() && force.numerator.abs() > 1.0e-12 {
-        terms.push(force.formatted_displacement());
+        terms.push(mohr_frame::format_symbolic_force(force.numerator));
     }
     if effects.thermal && thermal_numeric.is_none() && thermal.coefficient.abs() > 1.0e-12 {
-        terms.push(thermal.formatted_displacement());
+        terms.push(format!("α · {}", format_number(thermal.coefficient)));
     }
-    let numeric = force_numeric.unwrap_or(0.0)
-        + thermal_numeric.unwrap_or(0.0)
-        + if effects.kinematic { kinematic } else { 0.0 };
+    let numeric = if effects.force {
+        force_numeric.unwrap_or(force.numeric_part)
+    } else {
+        0.0
+    } + if effects.thermal {
+        thermal_numeric.unwrap_or(thermal.numeric_part)
+    } else {
+        0.0
+    } + if effects.kinematic { kinematic } else { 0.0 };
     if numeric.abs() > 1.0e-12 {
         terms.push(format_number(numeric));
     }
@@ -677,10 +702,8 @@ fn combined_value(
 
 fn integration_formula(method: IntegrationMethod) -> &'static str {
     match method {
-        IntegrationMethod::TrapezoidalProduct => {
-            "I = L/6 · [Mₚ,L·(2·mL + mR) + Mₚ,R·(mL + 2·mR)] / k"
-        }
-        IntegrationMethod::SimpsonThreePoint => "I = L/6 · [Mₚ,L·mL + 4·Mₚ,m·mm + Mₚ,R·mR] / k",
+        IntegrationMethod::TrapezoidalProduct => "I = L/6 · [Mₚ,L·(2·mL + mR) + Mₚ,R·(mL + 2·mR)]",
+        IntegrationMethod::SimpsonThreePoint => "I = L/6 · [Mₚ,L·mL + 4·Mₚ,m·mm + Mₚ,R·mR]",
     }
 }
 
@@ -689,27 +712,39 @@ fn substituted_integral(length: f64, item: &mohr_frame::SegmentContribution) -> 
     let unit = item.unit_values.map(format_number);
     match item.method {
         IntegrationMethod::TrapezoidalProduct => format!(
-            "{}/6 · [{}·(2·{} + {}) + {}·({} + 2·{})] / {}",
+            "{}/6 · [{}·(2·{} + {}) + {}·({} + 2·{})]",
             format_number(length),
             load[0],
             unit[0],
             unit[2],
             load[2],
             unit[0],
-            unit[2],
-            format_number(item.rigidity_factor)
+            unit[2]
         ),
         IntegrationMethod::SimpsonThreePoint => format!(
-            "{}/6 · [{}·{} + 4·{}·{} + {}·{}] / {}",
+            "{}/6 · [{}·{} + 4·{}·{} + {}·{}]",
             format_number(length),
             load[0],
             unit[0],
             load[1],
             unit[1],
             load[2],
-            unit[2],
-            format_number(item.rigidity_factor)
+            unit[2]
         ),
+    }
+}
+
+fn force_contribution_text(item: &mohr_frame::SegmentContribution) -> String {
+    match item.property {
+        Some(value) if value.numeric => format_number(item.integral),
+        _ => format!("{} / EI", format_number(item.integral)),
+    }
+}
+
+fn thermal_contribution_text(item: &mohr_frame::ThermalRodContribution) -> String {
+    match item.property {
+        Some(value) if value.numeric => format_number(item.coefficient),
+        _ => format!("α · {}", format_number(item.coefficient)),
     }
 }
 
@@ -907,7 +942,7 @@ fn core_properties_xml() -> &'static str {
 }
 
 fn app_properties_xml() -> &'static str {
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.7.0</AppVersion></Properties>"#
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.7.1</AppVersion></Properties>"#
 }
 
 fn styles_xml() -> &'static str {
@@ -1350,6 +1385,8 @@ mod tests {
                 id: "AB".into(),
                 start_node: 0,
                 end_node: 1,
+                rigidity_preset_id: None,
+                thermal_preset_id: None,
                 rigidity_factor: 1.0,
                 section_height: 0.5,
                 thermal_expansion_factor: 1.0,
@@ -1373,6 +1410,8 @@ mod tests {
                 unit_normal_rotation_diagram: zero(),
             }],
             target_node: 1,
+            rigidity_presets: Vec::new(),
+            thermal_presets: Vec::new(),
             supports: Vec::new(),
         }
     }
@@ -1416,11 +1455,13 @@ mod tests {
         let force = CalculationResult {
             contributions: Vec::new(),
             numerator: 6.0,
+            numeric_part: 0.0,
             rigidity: Rigidity::Symbolic,
         };
         let thermal = ThermalCalculationResult {
             contributions: Vec::new(),
             coefficient: 2.0,
+            numeric_part: 0.0,
             expansion: ThermalExpansion::Symbolic,
         };
         assert_eq!(
@@ -1452,15 +1493,59 @@ mod tests {
     }
 
     #[test]
+    fn disabled_mixed_effect_does_not_contribute_numeric_part() {
+        let force = CalculationResult {
+            contributions: vec![],
+            numerator: 6.0,
+            numeric_part: 0.5,
+            rigidity: Rigidity::Symbolic,
+        };
+        let thermal = ThermalCalculationResult {
+            contributions: vec![],
+            coefficient: 2.0,
+            numeric_part: 0.25,
+            expansion: ThermalExpansion::Symbolic,
+        };
+        assert_eq!(
+            combined_value(
+                &force,
+                &thermal,
+                0.0,
+                EffectsSelection {
+                    force: false,
+                    thermal: true,
+                    kinematic: false
+                }
+            ),
+            "α · 2 + 0.25"
+        );
+        assert_eq!(
+            combined_value(
+                &force,
+                &thermal,
+                0.0,
+                EffectsSelection {
+                    force: true,
+                    thermal: false,
+                    kinematic: false
+                }
+            ),
+            "6 / EI + 0.5"
+        );
+    }
+
+    #[test]
     fn mixed_symbolic_and_numeric_effects_are_summed_once() {
         let force = CalculationResult {
             contributions: Vec::new(),
             numerator: 6.0,
+            numeric_part: 0.0,
             rigidity: Rigidity::numeric(2.0).unwrap(),
         };
         let thermal = ThermalCalculationResult {
             contributions: Vec::new(),
             coefficient: 2.0,
+            numeric_part: 0.0,
             expansion: ThermalExpansion::Symbolic,
         };
         assert_eq!(
