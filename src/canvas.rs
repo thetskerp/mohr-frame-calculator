@@ -1,8 +1,8 @@
 //! Интерактивный холс рамы и эпюр.
 
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontFamily, FontId, PointerButton, Pos2, Rect, RichText,
-    Sense, Shape, Stroke, Vec2,
+    self, Align2, Color32, CursorIcon, DragValue, FontFamily, FontId, PointerButton, Pos2, Rect,
+    RichText, Sense, Shape, Stroke, Vec2,
 };
 use mohr_frame::{format_number, Diagram, Point, Rod, StructuralModel, SupportDirection};
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,11 @@ impl CanvasCamera {
         self.center_offset[0] -= screen_delta.x / screen_scale;
         self.center_offset[1] += screen_delta.y / screen_scale;
     }
+
+    fn pan_from_drag(&mut self, origin: DragOrigin, total_delta: Vec2) {
+        self.center_offset = origin.center_offset;
+        self.pan_by(total_delta, origin.screen_scale);
+    }
 }
 
 fn default_ordinate_scales() -> Vec<f32> {
@@ -122,6 +127,13 @@ impl CanvasViewState {
         let scale = &mut self.ordinate_scales[choice.index()];
         *scale = (*scale * factor).clamp(MIN_DIAGRAM_SCALE, MAX_DIAGRAM_SCALE);
     }
+
+    fn set_diagram_scale(&mut self, choice: DiagramChoice, scale: f32) {
+        if self.ordinate_scales.len() < 9 {
+            self.ordinate_scales.resize(9, 1.0);
+        }
+        self.ordinate_scales[choice.index()] = scale.clamp(MIN_DIAGRAM_SCALE, MAX_DIAGRAM_SCALE);
+    }
 }
 
 pub struct CanvasOptions<'a> {
@@ -140,7 +152,20 @@ pub fn frame_canvas(
     view_state: &mut CanvasViewState,
 ) {
     egui::Frame::canvas(ui.style()).show(ui, |ui| {
-        ui.label(RichText::new(options.title).strong());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(options.title).strong());
+            if let Some(choice) = options.diagram {
+                let mut scale = view_state.diagram_scale(choice);
+                ui.add(
+                    DragValue::new(&mut scale)
+                        .range(MIN_DIAGRAM_SCALE..=MAX_DIAGRAM_SCALE)
+                        .speed(0.05)
+                        .prefix("Высота ×"),
+                )
+                .on_hover_text("Масштаб ординат этой эпюры; также Shift + колесо над холстом");
+                view_state.set_diagram_scale(choice, scale);
+            }
+        });
         let size = Vec2::new(ui.available_width(), options.height - 26.0);
         let (response, base_painter) = ui.allocate_painter(size, Sense::click_and_drag());
         let cursor = if response.dragged() {
@@ -173,17 +198,16 @@ pub fn frame_canvas(
                     screen_scale: transform.scale,
                 });
             }
-            if response.dragged_by(PointerButton::Primary)
-                || response.drag_stopped_by(PointerButton::Primary)
-            {
+            if response.dragged_by(PointerButton::Primary) {
                 let origin = view_state.drag_origin.get_or_insert(DragOrigin {
                     center_offset: view_state.camera.center_offset,
                     screen_scale: transform.scale,
                 });
-                view_state.camera.center_offset = origin.center_offset;
-                view_state
-                    .camera
-                    .pan_by(response.drag_delta(), origin.screen_scale);
+                if let Some(total_delta) = response.total_drag_delta() {
+                    // total_drag_delta считается от начала жеста. drag_delta даёт
+                    // только сдвиг за кадр и здесь почти обнулял перетаскивание.
+                    view_state.camera.pan_from_drag(*origin, total_delta);
+                }
             }
             if response.drag_stopped_by(PointerButton::Primary) {
                 view_state.drag_origin = None;
@@ -193,13 +217,14 @@ pub fn frame_canvas(
         if response.hovered() {
             let (scroll, shift, pointer) = ui.input(|input| {
                 (
-                    input.smooth_scroll_delta.y,
+                    input.smooth_scroll_delta,
                     input.modifiers.shift,
                     input.pointer.hover_pos(),
                 )
             });
-            if scroll.abs() > f32::EPSILON {
-                let factor = (scroll * 0.003).exp();
+            let amount = wheel_amount(scroll, shift && options.diagram.is_some());
+            if amount.abs() > f32::EPSILON {
+                let factor = (amount * 0.003).exp();
                 if let (true, Some(choice)) = (shift, options.diagram) {
                     view_state.scale_diagram(choice, factor);
                 } else if let Some(pointer) = pointer {
@@ -207,7 +232,7 @@ pub fn frame_canvas(
                 }
                 // Колесо над холстом уже обработано. Не передаём тот же жест
                 // внешней прокрутке вкладки.
-                ui.input_mut(|input| input.smooth_scroll_delta.y = 0.0);
+                ui.input_mut(|input| input.smooth_scroll_delta = Vec2::ZERO);
             }
         }
 
@@ -234,6 +259,15 @@ pub fn frame_canvas(
             draw_supports(&painter, model, &transform);
         }
     });
+}
+
+fn wheel_amount(scroll: Vec2, diagram_height_mode: bool) -> f32 {
+    // macOS может преобразовывать Shift + вертикальное колесо в горизонтальную прокрутку.
+    if diagram_height_mode && scroll.x.abs() > scroll.y.abs() {
+        scroll.x
+    } else {
+        scroll.y
+    }
 }
 
 fn zoom_about_pointer(
@@ -629,5 +663,23 @@ mod tests {
         assert_eq!(view.diagram_scale(DiagramChoice::UnitX), 1.0);
         view.scale_diagram(DiagramChoice::Load, 100.0);
         assert_eq!(view.diagram_scale(DiagramChoice::Load), MAX_DIAGRAM_SCALE);
+    }
+
+    #[test]
+    fn pan_uses_total_drag_distance_across_frames() {
+        let mut camera = CanvasCamera::default();
+        let origin = DragOrigin {
+            center_offset: camera.center_offset,
+            screen_scale: 10.0,
+        };
+        camera.pan_from_drag(origin, Vec2::new(10.0, 5.0));
+        camera.pan_from_drag(origin, Vec2::new(25.0, 15.0));
+        assert_eq!(camera.center_offset, [-2.5, 1.5]);
+    }
+
+    #[test]
+    fn shifted_horizontal_wheel_controls_diagram_height() {
+        assert_eq!(wheel_amount(Vec2::new(12.0, 0.0), true), 12.0);
+        assert_eq!(wheel_amount(Vec2::new(12.0, 0.0), false), 0.0);
     }
 }

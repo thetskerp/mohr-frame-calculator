@@ -942,7 +942,7 @@ fn core_properties_xml() -> &'static str {
 }
 
 fn app_properties_xml() -> &'static str {
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.7.1</AppVersion></Properties>"#
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.7.2</AppVersion></Properties>"#
 }
 
 fn styles_xml() -> &'static str {
