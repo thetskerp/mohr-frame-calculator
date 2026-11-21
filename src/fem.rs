@@ -846,11 +846,8 @@ impl Prepared {
                     - f[i]
             })
             .collect::<Vec<_>>();
-        let displacements = d.chunks_exact(3).map(|v| [v[0], v[1], v[2]]).collect();
-        let reactions = reactions
-            .chunks_exact(3)
-            .map(|v| [v[0], v[1], v[2]])
-            .collect();
+        let displacements = d.as_chunks::<3>().0.to_vec();
+        let reactions = reactions.as_chunks::<3>().0.to_vec();
         let members = self
             .elements
             .iter()
