@@ -7,6 +7,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod fem;
+
 const EPS: f64 = 1.0e-9;
 
 fn default_rigidity_factor() -> f64 {
@@ -594,6 +596,7 @@ pub enum SupportDirection {
     Horizontal,
     Vertical,
     Rotation,
+    Normal,
 }
 
 impl SupportDirection {
@@ -602,6 +605,7 @@ impl SupportDirection {
             Self::Horizontal => "X",
             Self::Vertical => "Y",
             Self::Rotation => "φ",
+            Self::Normal => "N",
         }
     }
 }
@@ -611,16 +615,24 @@ impl SupportDirection {
 pub struct SupportMotion {
     pub node: usize,
     pub direction: SupportDirection,
+    /// Угол нормали для наклонной подвижной или скользящей опоры.
+    #[serde(default = "default_support_normal_deg")]
+    pub normal_deg: f64,
     pub displacement: f64,
     pub unit_x_reaction: f64,
     pub unit_y_reaction: f64,
     pub unit_rotation_reaction: f64,
 }
 
+pub fn default_support_normal_deg() -> f64 {
+    90.0
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct KinematicContribution {
     pub node_id: String,
     pub direction: SupportDirection,
+    pub normal_deg: f64,
     pub displacement: f64,
     pub unit_reaction: f64,
     pub value: f64,
@@ -653,6 +665,7 @@ pub fn calculate_kinematic_displacement_components(
                 KinematicContribution {
                     node_id: model.nodes[support.node].id.clone(),
                     direction: support.direction,
+                    normal_deg: support.normal_deg,
                     displacement: support.displacement,
                     unit_reaction: reaction,
                     value: -reaction * support.displacement,
@@ -862,6 +875,7 @@ impl StructuralModel {
                 ));
             }
             if [
+                support.normal_deg,
                 support.displacement,
                 support.unit_x_reaction,
                 support.unit_y_reaction,
@@ -1887,6 +1901,7 @@ mod tests {
                 SupportMotion {
                     node: 0,
                     direction: SupportDirection::Horizontal,
+                    normal_deg: 90.0,
                     displacement: 0.5,
                     unit_x_reaction: -2.0,
                     unit_y_reaction: 3.0,
@@ -1895,6 +1910,7 @@ mod tests {
                 SupportMotion {
                     node: 0,
                     direction: SupportDirection::Vertical,
+                    normal_deg: 90.0,
                     displacement: 0.0,
                     unit_x_reaction: 10.0,
                     unit_y_reaction: 10.0,
@@ -1911,6 +1927,14 @@ mod tests {
         let mut duplicate = model;
         duplicate.supports[1].direction = SupportDirection::Horizontal;
         assert!(duplicate.validate().unwrap_err().contains("задано дважды"));
+    }
+
+    #[test]
+    fn legacy_support_motion_without_normal_angle_still_opens() {
+        let text = "(node:0,direction:Vertical,displacement:0.02,unit_x_reaction:0.0,unit_y_reaction:-1.0,unit_rotation_reaction:0.0)";
+        let motion: SupportMotion = ron::from_str(text).unwrap();
+        assert_eq!(motion.normal_deg, 90.0);
+        assert_eq!(motion.direction, SupportDirection::Vertical);
     }
 
     #[test]

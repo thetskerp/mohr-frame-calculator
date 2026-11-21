@@ -9,14 +9,584 @@ use std::io::Cursor;
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use mohr_frame::{
     calculate_displacement_components, calculate_kinematic_displacement_components,
-    calculate_thermal_displacement_components, format_number, CalculationResult, Diagram,
-    DisplacementComponents, EffectsSelection, FiberSide, IntegrationMethod,
-    KinematicDisplacementComponents, KinematicResult, Rigidity, StructuralModel,
-    ThermalCalculationResult, ThermalDisplacementComponents, ThermalExpansion,
+    calculate_thermal_displacement_components,
+    fem::{FemProject, FemResult, LoadCaseResult, SectionForces, StiffnessMode, SupportKind},
+    format_number, CalculationResult, Diagram, DisplacementComponents, EffectsSelection, FiberSide,
+    IntegrationMethod, KinematicDisplacementComponents, KinematicResult, Rigidity, StructuralModel,
+    SupportDirection, ThermalCalculationResult, ThermalDisplacementComponents, ThermalExpansion,
 };
 
 const REPORT_IMAGE_WIDTH: u32 = 1000;
 const REPORT_IMAGE_HEIGHT: u32 = 650;
+
+/// Независимый состав отчёта МКЭ; выбор сохраняется в открытом окне калькулятора.
+#[derive(Debug, Clone, Copy)]
+pub struct FemReportSections {
+    pub geometry: bool,
+    pub loads: bool,
+    pub stability: bool,
+    pub reactions: bool,
+    pub actual_diagrams: bool,
+    pub unit_diagrams: bool,
+}
+
+impl Default for FemReportSections {
+    fn default() -> Self {
+        Self {
+            geometry: true,
+            loads: true,
+            stability: true,
+            reactions: true,
+            actual_diagrams: true,
+            unit_diagrams: true,
+        }
+    }
+}
+
+impl FemReportSections {
+    fn any(self) -> bool {
+        self.geometry
+            || self.loads
+            || self.stability
+            || self.reactions
+            || self.actual_diagrams
+            || self.unit_diagrams
+    }
+}
+
+/// Отдельный отчёт МКЭ с независимым выбором разделов.
+pub fn build_fem_word_report(
+    model: &StructuralModel,
+    input: &FemProject,
+    result: &FemResult,
+    sections: FemReportSections,
+) -> Result<Vec<u8>, String> {
+    model.validate()?;
+    if !input.is_aligned(model) {
+        return Err("геометрия МКЭ не совпадает с текущей рамой".into());
+    }
+    if !sections.any() {
+        return Err("отметьте хотя бы один раздел отчёта МКЭ".into());
+    }
+    let mut body = String::new();
+    let mut images: Vec<(String, Vec<u8>)> = Vec::new();
+    body.push_str(&paragraph(
+        "Расчёт плоской стержневой рамы методом конечных элементов",
+        Some("Title"),
+        true,
+    ));
+    body.push_str(&paragraph(
+        &format!("Целевая точка: {}. Плоский элемент Эйлера — Бернулли; три степени свободы в узле (uₓ, uᵧ, φ).", input.target_node_id),
+        None, false,
+    ));
+
+    if sections.geometry {
+        body.push_str(&heading("Геометрия рамы", 1));
+        let rows = model
+            .nodes
+            .iter()
+            .map(|n| {
+                vec![
+                    n.id.clone(),
+                    format_number(n.position.x),
+                    format_number(n.position.y),
+                ]
+            })
+            .collect::<Vec<_>>();
+        body.push_str(&table(&["Точка", "X", "Y"], &rows));
+        let rows = model
+            .rods
+            .iter()
+            .map(|r| {
+                vec![
+                    r.id.clone(),
+                    model.nodes[r.start_node].id.clone(),
+                    model.nodes[r.end_node].id.clone(),
+                    format_number(model.rod_length(r).unwrap_or(0.0)),
+                ]
+            })
+            .collect::<Vec<_>>();
+        body.push_str(&table(&["Стержень", "Начало", "Конец", "L"], &rows));
+        let rid = images.len() + 2;
+        images.push(("frame.png".into(), render_fem_scheme_png(model, input)?));
+        body.push_str(&fem_image_paragraph(rid, "Геометрия рамы"));
+    }
+    if sections.loads {
+        body.push_str(&heading("Опоры, жёсткости и нагрузки", 1));
+        if result.stiffness_mode == StiffnessMode::Determinate {
+            body.push_str(&paragraph("Рама статически определима: эпюры и реакции получены без задания EA и EI. Аналитическая жёсткость остаётся в основном расчёте перемещений.", None, false));
+        }
+        let rows = input
+            .nodes
+            .iter()
+            .map(|n| {
+                vec![
+                    n.id.clone(),
+                    n.support.label().into(),
+                    if matches!(n.support, SupportKind::Roller | SupportKind::Guided) {
+                        format_number(n.normal_deg)
+                    } else {
+                        "—".into()
+                    },
+                    format_number(n.fx),
+                    format_number(n.fy),
+                    format_number(n.mz),
+                ]
+            })
+            .collect::<Vec<_>>();
+        body.push_str(&table(
+            &["Точка", "Опора", "Нормаль, °", "Fₓ", "Fᵧ", "Mᶻ"],
+            &rows,
+        ));
+        let rows = input
+            .members
+            .iter()
+            .map(|m| {
+                vec![
+                    m.id.clone(),
+                    if m.ea > 0.0 {
+                        format_number(m.ea)
+                    } else {
+                        "—".into()
+                    },
+                    if m.ei > 0.0 {
+                        format_number(m.ei)
+                    } else {
+                        "—".into()
+                    },
+                    format_number(m.qx),
+                    format_number(m.qy),
+                ]
+            })
+            .collect::<Vec<_>>();
+        body.push_str(&table(&["Стержень", "EA", "EI", "qₓ", "qᵧ"], &rows));
+        let rows = input
+            .members
+            .iter()
+            .flat_map(|m| {
+                m.point_loads.iter().map(move |p| {
+                    vec![
+                        m.id.clone(),
+                        format_number(p.xi),
+                        format_number(p.fx),
+                        format_number(p.fy),
+                        format_number(p.mz),
+                    ]
+                })
+            })
+            .collect::<Vec<_>>();
+        if !rows.is_empty() {
+            body.push_str(&caption("Сосредоточенные воздействия на стержнях"));
+            body.push_str(&table(&["Стержень", "x/L", "Fₓ", "Fᵧ", "Mᶻ"], &rows));
+        }
+    }
+    if sections.stability {
+        body.push_str(&heading("Проверка расчётной модели", 1));
+        body.push_str(&paragraph(&format!(
+            "Всего степеней свободы: {}. Связей: {}. Свободных степеней свободы: {}. Матрица расчёта невырождена для заданных опор.",
+            result.total_dof, result.constraints, result.total_dof - result.constraints,
+        ), None, false));
+    }
+    if sections.reactions {
+        body.push_str(&heading("Опорные реакции", 1));
+        append_fem_reactions(&mut body, model, input, "Грузовая система", &result.actual);
+        for unit in &result.units {
+            append_fem_reactions(
+                &mut body,
+                model,
+                input,
+                &format!("Единичная система {}", unit.component.label()),
+                &unit.result,
+            );
+        }
+    }
+    if sections.actual_diagrams {
+        body.push_str(&heading("Эпюры грузовой системы", 1));
+        for quantity in [FemQuantity::Moment, FemQuantity::Normal, FemQuantity::Shear] {
+            append_fem_diagram(
+                &mut body,
+                &mut images,
+                model,
+                &result.actual,
+                quantity,
+                "Грузовая система",
+            )?;
+        }
+    }
+    if sections.unit_diagrams {
+        body.push_str(&heading("Единичные эпюры для основного расчёта", 1));
+        for unit in &result.units {
+            for quantity in [FemQuantity::Moment, FemQuantity::Normal] {
+                append_fem_diagram(
+                    &mut body,
+                    &mut images,
+                    model,
+                    &unit.result,
+                    quantity,
+                    &format!("Единичная система {}", unit.component.label()),
+                )?;
+            }
+        }
+    }
+    body.push_str(r#"<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1008" w:right="1008" w:bottom="1008" w:left="1008"/></w:sectPr>"#);
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:body>{body}</w:body></w:document>"#
+    );
+    let mut relationships = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#,
+    );
+    for (i, (name, _)) in images.iter().enumerate() {
+        relationships.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/{}"/>"#, i + 2, name));
+    }
+    relationships.push_str("</Relationships>");
+    let mut archive = StoredZip::default();
+    archive.add("[Content_Types].xml", content_types_xml().as_bytes());
+    archive.add("_rels/.rels", package_relationships_xml().as_bytes());
+    archive.add("docProps/core.xml", core_properties_xml().as_bytes());
+    archive.add("docProps/app.xml", app_properties_xml().as_bytes());
+    archive.add("word/document.xml", document_xml.as_bytes());
+    archive.add("word/_rels/document.xml.rels", relationships.as_bytes());
+    archive.add("word/styles.xml", styles_xml().as_bytes());
+    for (name, bytes) in images {
+        archive.add(&format!("word/media/{name}"), &bytes);
+    }
+    archive.finish()
+}
+
+#[derive(Clone, Copy)]
+enum FemQuantity {
+    Moment,
+    Normal,
+    Shear,
+}
+
+impl FemQuantity {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Moment => "M",
+            Self::Normal => "N",
+            Self::Shear => "Q",
+        }
+    }
+    fn value(self, section: SectionForces) -> f64 {
+        match self {
+            Self::Moment => section.m,
+            Self::Normal => section.n,
+            Self::Shear => section.q,
+        }
+    }
+    fn color(self) -> Rgb<u8> {
+        match self {
+            Self::Moment => Rgb([202, 96, 32]),
+            Self::Normal => Rgb([128, 73, 170]),
+            Self::Shear => Rgb([155, 125, 12]),
+        }
+    }
+}
+
+fn append_fem_reactions(
+    body: &mut String,
+    model: &StructuralModel,
+    input: &FemProject,
+    title: &str,
+    case: &LoadCaseResult,
+) {
+    body.push_str(&heading(title, 2));
+    let rows = model
+        .nodes
+        .iter()
+        .zip(&input.nodes)
+        .zip(&case.reactions)
+        .filter(|((_, data), _)| data.support != SupportKind::Free)
+        .map(|((node, data), r)| {
+            vec![
+                node.id.clone(),
+                format_number(r[0]),
+                format_number(r[1]),
+                format_number(r[2]),
+                if matches!(data.support, SupportKind::Roller | SupportKind::Guided) {
+                    let angle = data.normal_deg.to_radians();
+                    format_number(r[0] * angle.cos() + r[1] * angle.sin())
+                } else {
+                    "—".into()
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    body.push_str(&table(&["Опора", "Rₓ", "Rᵧ", "Mᶻ", "Rₙ"], &rows));
+}
+
+fn append_fem_diagram(
+    body: &mut String,
+    images: &mut Vec<(String, Vec<u8>)>,
+    model: &StructuralModel,
+    case: &LoadCaseResult,
+    quantity: FemQuantity,
+    title: &str,
+) -> Result<(), String> {
+    let heading_text = format!("{title}: эпюра {}", quantity.label());
+    body.push_str(&heading(&heading_text, 2));
+    let rid = images.len() + 2;
+    let name = format!("fem_epure_{}.png", rid);
+    images.push((name, render_fem_epure_png(model, case, quantity)?));
+    body.push_str(&fem_image_paragraph(rid, &heading_text));
+    let rows = model
+        .rods
+        .iter()
+        .zip(&case.members)
+        .map(|(rod, member)| {
+            vec![
+                rod.id.clone(),
+                format_number(quantity.value(member.at(0.0))),
+                format_number(quantity.value(member.at(member.length / 2.0))),
+                format_number(quantity.value(member.at(member.length))),
+            ]
+        })
+        .collect::<Vec<_>>();
+    body.push_str(&table(&["Стержень", "Начало", "Середина", "Конец"], &rows));
+    Ok(())
+}
+
+fn fem_image_paragraph(rid: usize, description: &str) -> String {
+    format!(
+        r#"<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="5943600" cy="3863340"/><wp:docPr id="{rid}" name="Эпюра" descr="{}"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="{rid}" name="fem.png"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rId{rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="5943600" cy="3863340"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#,
+        xml_escape(description)
+    )
+}
+
+fn render_fem_epure_png(
+    model: &StructuralModel,
+    case: &LoadCaseResult,
+    quantity: FemQuantity,
+) -> Result<Vec<u8>, String> {
+    let mut image = RgbImage::from_pixel(
+        REPORT_IMAGE_WIDTH,
+        REPORT_IMAGE_HEIGHT,
+        Rgb([255, 255, 255]),
+    );
+    let min_x = model
+        .nodes
+        .iter()
+        .map(|n| n.position.x)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = model
+        .nodes
+        .iter()
+        .map(|n| n.position.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = model
+        .nodes
+        .iter()
+        .map(|n| n.position.y)
+        .fold(f64::INFINITY, f64::min);
+    let max_y = model
+        .nodes
+        .iter()
+        .map(|n| n.position.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let range_x = (max_x - min_x).max(1.0);
+    let range_y = (max_y - min_y).max(1.0);
+    let scale = ((REPORT_IMAGE_WIDTH as f64 - 300.0) / range_x)
+        .min((REPORT_IMAGE_HEIGHT as f64 - 240.0) / range_y);
+    let ox = (REPORT_IMAGE_WIDTH as f64 - (max_x - min_x) * scale) / 2.0;
+    let oy = (REPORT_IMAGE_HEIGHT as f64 - (max_y - min_y) * scale) / 2.0;
+    let point = |x: f64, y: f64| -> (i32, i32) {
+        (
+            (ox + (x - min_x) * scale).round() as i32,
+            (REPORT_IMAGE_HEIGHT as f64 - oy - (y - min_y) * scale).round() as i32,
+        )
+    };
+    let max = case
+        .members
+        .iter()
+        .flat_map(|m| (0..=80).map(move |i| quantity.value(m.at(m.length * i as f64 / 80.0)).abs()))
+        .fold(0.0_f64, f64::max);
+    let ordinate_scale = if max < 1e-12 { 0.0 } else { 95.0 / max };
+    let ink = Rgb([45, 54, 64]);
+    let color = quantity.color();
+    for (rod, member) in model.rods.iter().zip(&case.members) {
+        let a = model.nodes[rod.start_node].position;
+        let b = model.nodes[rod.end_node].position;
+        let start = point(a.x, a.y);
+        let end = point(b.x, b.y);
+        draw_line(&mut image, start, end, ink, 3);
+        let dx = (end.0 - start.0) as f64;
+        let dy = (end.1 - start.1) as f64;
+        let length = dx.hypot(dy).max(1.0);
+        let normal = (-dy / length, dx / length);
+        let ordinate_point = |t: f64, value: f64| -> (i32, i32) {
+            (
+                (start.0 as f64 + dx * t + normal.0 * value * ordinate_scale).round() as i32,
+                (start.1 as f64 + dy * t + normal.1 * value * ordinate_scale).round() as i32,
+            )
+        };
+        let mut samples = (0..=80).map(|i| i as f64 / 80.0).collect::<Vec<_>>();
+        for load in &member.point_loads_local {
+            samples.push((load.xi - 1e-8).max(0.0));
+            samples.push((load.xi + 1e-8).min(1.0));
+        }
+        samples.sort_by(|a, b| a.total_cmp(b));
+        let mut previous = None;
+        for t in samples {
+            let value = quantity.value(member.at(t * member.length));
+            let p = ordinate_point(t, value);
+            if let Some(last) = previous {
+                draw_line(&mut image, last, p, color, 2);
+            }
+            previous = Some(p);
+        }
+        draw_text_centered(
+            &mut image,
+            &rod.id,
+            ((start.0 + end.0) / 2, (start.1 + end.1) / 2 - 18),
+            2,
+            ink,
+        );
+    }
+    for node in &model.nodes {
+        let p = point(node.position.x, node.position.y);
+        draw_filled_circle(&mut image, p, 5, Rgb([255, 255, 255]));
+        draw_circle(&mut image, p, 5, ink, 2);
+        draw_text(&mut image, &node.id, (p.0 + 9, p.1 + 5), 2, ink);
+    }
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(image)
+        .write_to(&mut bytes, ImageFormat::Png)
+        .map_err(|error| format!("не удалось подготовить эпюру для Word: {error}"))?;
+    Ok(bytes.into_inner())
+}
+
+fn render_fem_scheme_png(model: &StructuralModel, input: &FemProject) -> Result<Vec<u8>, String> {
+    let base = render_scheme_png(model)?;
+    let mut image = image::load_from_memory(&base)
+        .map_err(|error| format!("не удалось открыть изображение схемы: {error}"))?
+        .to_rgb8();
+    let min_x = model
+        .nodes
+        .iter()
+        .map(|n| n.position.x)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = model
+        .nodes
+        .iter()
+        .map(|n| n.position.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = model
+        .nodes
+        .iter()
+        .map(|n| n.position.y)
+        .fold(f64::INFINITY, f64::min);
+    let max_y = model
+        .nodes
+        .iter()
+        .map(|n| n.position.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let range_x = (max_x - min_x).max(1.0);
+    let range_y = (max_y - min_y).max(1.0);
+    let scale = ((REPORT_IMAGE_WIDTH as f64 - 260.0) / range_x)
+        .min((REPORT_IMAGE_HEIGHT as f64 - 190.0) / range_y);
+    let ox = (REPORT_IMAGE_WIDTH as f64 - range_x * scale) / 2.0;
+    let oy = (REPORT_IMAGE_HEIGHT as f64 - range_y * scale) / 2.0;
+    let ink = Rgb([42, 99, 145]);
+    for (index, (node, data)) in model.nodes.iter().zip(&input.nodes).enumerate() {
+        let p = (
+            (ox + (node.position.x - min_x) * scale).round() as i32,
+            (REPORT_IMAGE_HEIGHT as f64 - oy - (node.position.y - min_y) * scale).round() as i32,
+        );
+        if data.support == SupportKind::Free {
+            continue;
+        }
+        if data.support == SupportKind::Fixed {
+            let direction = model
+                .rods
+                .iter()
+                .filter_map(|rod| {
+                    let other = if rod.start_node == index {
+                        rod.end_node
+                    } else if rod.end_node == index {
+                        rod.start_node
+                    } else {
+                        return None;
+                    };
+                    let neighbor = model.nodes.get(other)?;
+                    let q = (
+                        ox + (neighbor.position.x - min_x) * scale,
+                        REPORT_IMAGE_HEIGHT as f64 - oy - (neighbor.position.y - min_y) * scale,
+                    );
+                    Some((p.0 as f64 - q.0, p.1 as f64 - q.1))
+                })
+                .fold((0.0, 0.0), |sum, d| (sum.0 + d.0, sum.1 + d.1));
+            let length = direction.0.hypot(direction.1);
+            let outward = if length > 1e-9 {
+                (direction.0 / length, direction.1 / length)
+            } else {
+                (-1.0, 0.0)
+            };
+            let tangent = (-outward.1, outward.0);
+            let at = |along: f64, away: f64| -> (i32, i32) {
+                (
+                    (p.0 as f64 + tangent.0 * along + outward.0 * away).round() as i32,
+                    (p.1 as f64 + tangent.1 * along + outward.1 * away).round() as i32,
+                )
+            };
+            draw_line(&mut image, at(-25.0, 11.0), at(25.0, 11.0), ink, 4);
+            for y in [-24.0, -12.0, 0.0, 12.0, 24.0] {
+                draw_line(&mut image, at(y, 11.0), at(y + 8.0, 23.0), ink, 2);
+            }
+            continue;
+        }
+        let a = if data.support == SupportKind::Pin {
+            90.0
+        } else {
+            data.normal_deg
+        }
+        .to_radians();
+        let v = (-a.cos(), a.sin());
+        let u = (v.1, -v.0);
+        let at = |along: f64, away: f64| -> (i32, i32) {
+            (
+                (p.0 as f64 + u.0 * along + v.0 * away).round() as i32,
+                (p.1 as f64 + u.1 * along + v.1 * away).round() as i32,
+            )
+        };
+        if data.support == SupportKind::Guided {
+            draw_line(&mut image, at(-13.0, 9.0), at(13.0, 9.0), ink, 4);
+            draw_line(&mut image, at(-13.0, 9.0), at(-13.0, 20.0), ink, 2);
+            draw_line(&mut image, at(13.0, 9.0), at(13.0, 20.0), ink, 2);
+        } else {
+            draw_line(&mut image, at(0.0, 4.0), at(-17.0, 24.0), ink, 3);
+            draw_line(&mut image, at(0.0, 4.0), at(17.0, 24.0), ink, 3);
+            draw_line(&mut image, at(-17.0, 24.0), at(17.0, 24.0), ink, 3);
+            if data.support == SupportKind::Roller {
+                for side in [-9.0, 9.0] {
+                    draw_circle(&mut image, at(side, 29.0), 4, ink, 2);
+                }
+            }
+        }
+        let distance = if data.support == SupportKind::Pin {
+            27.0
+        } else if data.support == SupportKind::Roller {
+            35.0
+        } else {
+            23.0
+        };
+        draw_line(&mut image, at(-22.0, distance), at(22.0, distance), ink, 2);
+        for s in [-18.0, -9.0, 0.0, 9.0, 18.0] {
+            draw_line(
+                &mut image,
+                at(s, distance),
+                at(s - 6.0, distance + 8.0),
+                ink,
+                1,
+            );
+        }
+    }
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(image)
+        .write_to(&mut bytes, ImageFormat::Png)
+        .map_err(|error| format!("не удалось подготовить схему МКЭ: {error}"))?;
+    Ok(bytes.into_inner())
+}
 
 /// Создаёт готовый DOCX-отчёт в памяти.
 pub fn build_word_report(
@@ -607,7 +1177,11 @@ fn append_kinematic_component(
         .map(|item| {
             vec![
                 item.node_id.clone(),
-                item.direction.symbol().into(),
+                if item.direction == SupportDirection::Normal {
+                    format!("N ({}°)", format_number(item.normal_deg))
+                } else {
+                    item.direction.symbol().into()
+                },
                 format_number(item.displacement),
                 format_number(item.unit_reaction),
                 format_number(item.value),
@@ -942,7 +1516,7 @@ fn core_properties_xml() -> &'static str {
 }
 
 fn app_properties_xml() -> &'static str {
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.7.2</AppVersion></Properties>"#
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Mohr Frame</Application><AppVersion>0.8.0</AppVersion></Properties>"#
 }
 
 fn styles_xml() -> &'static str {
@@ -1353,6 +1927,7 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mohr_frame::fem::{FemProject, SupportKind};
     use mohr_frame::{
         DiagramKind, FiberSide, Node, Ordinate, Point, Rod, SupportDirection, SupportMotion,
     };
@@ -1569,6 +2144,7 @@ mod tests {
         model.supports.push(SupportMotion {
             node: 0,
             direction: SupportDirection::Horizontal,
+            normal_deg: 90.0,
             displacement: 0.5,
             unit_x_reaction: -2.0,
             unit_y_reaction: 0.0,
@@ -1608,5 +2184,58 @@ mod tests {
     #[test]
     fn xml_escaping_preserves_valid_markup() {
         assert_eq!(xml_escape("A&B<1>"), "A&amp;B&lt;1&gt;");
+    }
+
+    #[test]
+    fn fem_report_respects_section_checkboxes_and_contains_unit_images() {
+        let model = model();
+        let mut input = FemProject::default();
+        input.reconcile(&model);
+        input.target_node_id = "B".into();
+        input.nodes[0].support = SupportKind::Fixed;
+        input.nodes[1].fy = -1.0;
+        input.members[0].ea = 1000.0;
+        input.members[0].ei = 10.0;
+        let result = input.solve(&model).unwrap();
+        let full =
+            build_fem_word_report(&model, &input, &result, FemReportSections::default()).unwrap();
+        assert!(full.starts_with(b"PK"));
+        assert!(full
+            .windows("word/media/fem_epure_".len())
+            .any(|w| w == b"word/media/fem_epure_"));
+        assert!(full
+            .windows("Единичные эпюры".len())
+            .any(|w| w == "Единичные эпюры".as_bytes()));
+        assert!(!full
+            .windows("Узловые перемещения грузовой системы".len())
+            .any(|w| w == "Узловые перемещения грузовой системы".as_bytes()));
+        let reactions_only = FemReportSections {
+            geometry: false,
+            loads: false,
+            stability: false,
+            reactions: true,
+            actual_diagrams: false,
+            unit_diagrams: false,
+        };
+        let selected = build_fem_word_report(&model, &input, &result, reactions_only).unwrap();
+        assert!(selected
+            .windows("Опорные реакции".len())
+            .any(|w| w == "Опорные реакции".as_bytes()));
+        assert!(!selected
+            .windows("Геометрия рамы".len())
+            .any(|w| w == "Геометрия рамы".as_bytes()));
+        assert!(!selected
+            .windows("word/media/".len())
+            .any(|w| w == b"word/media/"));
+
+        input.members[0].ea = 0.0;
+        input.members[0].ei = 0.0;
+        let analytical = input.solve(&model).unwrap();
+        let report =
+            build_fem_word_report(&model, &input, &analytical, FemReportSections::default())
+                .unwrap();
+        assert!(report
+            .windows("Рама статически определима".len())
+            .any(|w| w == "Рама статически определима".as_bytes()));
     }
 }

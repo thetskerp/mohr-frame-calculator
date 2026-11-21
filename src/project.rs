@@ -6,17 +6,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mohr_frame::{Diagram, EffectsSelection, Node, Rigidity, StructuralModel, ThermalExpansion};
+use mohr_frame::{
+    fem::FemProject, Diagram, EffectsSelection, Node, Rigidity, StructuralModel, ThermalExpansion,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::canvas::CanvasViewState;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 const PROJECT_FORMAT_ID: &str = "mohr-frame-project";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectData {
     pub model: StructuralModel,
+    #[serde(default)]
+    pub fem: FemProject,
     pub rigidity: Rigidity,
     #[serde(default)]
     pub thermal_expansion: ThermalExpansion,
@@ -94,7 +98,7 @@ fn save_project_with_paths(paths: &ProjectPaths, data: &ProjectData) -> Result<P
         format: PROJECT_FORMAT_ID.into(),
         schema_version: CURRENT_SCHEMA_VERSION,
         created_with: env!("CARGO_PKG_VERSION").into(),
-        minimum_reader: "0.7.1".into(),
+        minimum_reader: "0.8.0".into(),
         data: data.clone(),
     };
     let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::default())
@@ -140,6 +144,29 @@ pub fn save_word_report(project_name: &str, bytes: &[u8]) -> Result<PathBuf, Str
 pub fn save_word_report_for_path(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let paths = project_paths_from_scheme(path)?;
     save_word_report_with_paths(&paths, bytes)
+}
+
+pub fn save_fem_word_report(project_name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let paths = project_paths(project_name)?;
+    save_fem_word_report_with_paths(&paths, bytes)
+}
+
+pub fn save_fem_word_report_for_path(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let paths = project_paths_from_scheme(path)?;
+    save_fem_word_report_with_paths(&paths, bytes)
+}
+
+fn save_fem_word_report_with_paths(paths: &ProjectPaths, bytes: &[u8]) -> Result<PathBuf, String> {
+    fs::create_dir_all(&paths.directory).map_err(|error| {
+        format!(
+            "не удалось создать папку проекта {}: {error}",
+            paths.directory.display()
+        )
+    })?;
+    let name = project_name_from_path(&paths.scheme)?;
+    let destination = paths.directory.join(format!("{name}-fem-report.docx"));
+    atomic_write(&destination, bytes)?;
+    Ok(destination)
 }
 
 fn save_word_report_with_paths(paths: &ProjectPaths, bytes: &[u8]) -> Result<PathBuf, String> {
@@ -255,6 +282,7 @@ pub(crate) fn deserialize_project_text(text: &str) -> Result<(ProjectData, bool)
         legacy.model.validate_for_loading()?;
         let mut data = ProjectData {
             model: legacy.model,
+            fem: FemProject::default(),
             rigidity: legacy.rigidity,
             thermal_expansion: ThermalExpansion::Symbolic,
             effects: EffectsSelection::default(),
@@ -493,6 +521,7 @@ mod tests {
                 thermal_presets: Vec::new(),
                 supports: Vec::new(),
             },
+            fem: FemProject::default(),
             rigidity: Rigidity::Symbolic,
             thermal_expansion: ThermalExpansion::Symbolic,
             effects: EffectsSelection::default(),
@@ -570,11 +599,18 @@ mod tests {
         data.model.supports.push(SupportMotion {
             node: 0,
             direction: SupportDirection::Vertical,
+            normal_deg: 90.0,
             displacement: 0.25,
             unit_x_reaction: 2.0,
             unit_y_reaction: -1.0,
             unit_rotation_reaction: 0.5,
         });
+        data.fem.reconcile(&data.model);
+        data.fem.nodes[0].support = mohr_frame::fem::SupportKind::Fixed;
+        data.fem.members[0].ea = 2.0e5;
+        data.fem.members[0].ei = 3.0e3;
+        data.fem.members[0].qy = -5.0;
+        data.fem.units.rotation = false;
         let file = ProjectFileV2 {
             format: PROJECT_FORMAT_ID.into(),
             schema_version: CURRENT_SCHEMA_VERSION,
@@ -586,6 +622,47 @@ mod tests {
         let (restored, migrated) = deserialize_project_text(&text).unwrap();
         assert!(!migrated);
         assert_eq!(restored, data);
+    }
+
+    #[test]
+    fn v072_file_without_fem_data_opens_with_empty_calculator() {
+        #[derive(Serialize)]
+        struct DataV5<'a> {
+            model: &'a StructuralModel,
+            rigidity: &'a Rigidity,
+            thermal_expansion: &'a ThermalExpansion,
+            effects: &'a EffectsSelection,
+            show_values: bool,
+            view_state: &'a CanvasViewState,
+        }
+        #[derive(Serialize)]
+        struct FileV5<'a> {
+            format: &'a str,
+            schema_version: u32,
+            created_with: &'a str,
+            minimum_reader: &'a str,
+            data: DataV5<'a>,
+        }
+        let old = sample_data();
+        let file = FileV5 {
+            format: PROJECT_FORMAT_ID,
+            schema_version: 5,
+            created_with: "0.7.2",
+            minimum_reader: "0.7.1",
+            data: DataV5 {
+                model: &old.model,
+                rigidity: &old.rigidity,
+                thermal_expansion: &old.thermal_expansion,
+                effects: &old.effects,
+                show_values: old.show_values,
+                view_state: &old.view_state,
+            },
+        };
+        let text = ron::ser::to_string(&file).unwrap();
+        let (loaded, migrated) = deserialize_project_text(&text).unwrap();
+        assert!(migrated);
+        assert_eq!(loaded.model, old.model);
+        assert_eq!(loaded.fem, FemProject::default());
     }
 
     #[test]

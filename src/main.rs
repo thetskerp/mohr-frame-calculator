@@ -2,6 +2,7 @@
 
 mod canvas;
 mod docx_report;
+mod fem_window;
 mod project;
 mod property_editor;
 mod table_editor;
@@ -9,22 +10,24 @@ mod table_editor;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use canvas::{frame_canvas, CanvasOptions, CanvasViewState, DiagramChoice, GOST_FONT_FAMILY};
-use docx_report::build_word_report;
+use docx_report::{build_fem_word_report, build_word_report};
 use eframe::egui::{
     self, Align2, Color32, ComboBox, DragValue, FontData, FontDefinitions, FontFamily, RichText,
     Vec2,
 };
+use fem_window::FemWindow;
 use mohr_frame::{
     calculate_displacement_components, calculate_kinematic_displacement_components,
-    calculate_thermal_displacement_components, format_number, next_node_id, CalculationResult,
-    Diagram, DiagramKind, EffectsSelection, FiberSide, Frame, KinematicResult, Node, Ordinate,
-    Point, PropertyPreset, Rigidity, Rod, SegmentOrientation, StructuralModel, SupportDirection,
-    SupportMotion, TemperatureLoad, ThermalCalculationResult, ThermalExpansion,
+    calculate_thermal_displacement_components, fem::FemProject, format_number, next_node_id,
+    CalculationResult, Diagram, DiagramKind, EffectsSelection, FiberSide, Frame, KinematicResult,
+    Node, Ordinate, Point, PropertyPreset, Rigidity, Rod, SegmentOrientation, StructuralModel,
+    SupportDirection, SupportMotion, TemperatureLoad, ThermalCalculationResult, ThermalExpansion,
 };
 use project::{
     export_for_v050, export_for_v050_for_path, load_project_from_path, project_name_from_path,
     project_paths, project_paths_from_scheme, project_root_dir, sanitize_project_name_input,
-    save_project, save_project_to_path, save_word_report, save_word_report_for_path, ProjectData,
+    save_fem_word_report, save_fem_word_report_for_path, save_project, save_project_to_path,
+    save_word_report, save_word_report_for_path, ProjectData,
 };
 use property_editor::PropertyEditor;
 use rfd::FileDialog;
@@ -47,7 +50,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!(
-                "Метод Мора v{} — перемещения и поворот точки рамы",
+                "Mohr Frame v{} — перемещения и расчёт плоской рамы",
                 env!("CARGO_PKG_VERSION")
             ))
             .with_inner_size([1380.0, 860.0])
@@ -66,6 +69,8 @@ fn main() -> eframe::Result {
 struct MohrApp {
     #[serde(default)]
     model: StructuralModel,
+    #[serde(default)]
+    fem: FemProject,
     #[serde(default = "symbolic_rigidity")]
     rigidity: Rigidity,
     #[serde(default)]
@@ -98,6 +103,8 @@ struct MohrApp {
     table_editor: TableEditor,
     #[serde(skip)]
     property_editor: PropertyEditor,
+    #[serde(skip)]
+    fem_window: FemWindow,
     /// Поле используется только для однократного импорта состояния старой версии.
     #[serde(default, rename = "frame", skip_serializing)]
     legacy_frame: Frame,
@@ -109,6 +116,7 @@ impl Default for MohrApp {
         model.ensure_property_presets(Rigidity::Symbolic, ThermalExpansion::Symbolic);
         Self {
             model,
+            fem: FemProject::default(),
             rigidity: Rigidity::Symbolic,
             thermal_expansion: ThermalExpansion::Symbolic,
             effects: EffectsSelection::default(),
@@ -124,6 +132,7 @@ impl Default for MohrApp {
             confirm_clear: false,
             table_editor: TableEditor::default(),
             property_editor: PropertyEditor::default(),
+            fem_window: FemWindow::default(),
             legacy_frame: Frame::default(),
         }
     }
@@ -170,6 +179,7 @@ impl MohrApp {
     fn project_data(&self) -> ProjectData {
         ProjectData {
             model: self.model.clone(),
+            fem: self.fem.clone(),
             rigidity: self.rigidity,
             thermal_expansion: self.thermal_expansion,
             effects: self.effects,
@@ -223,6 +233,8 @@ impl MohrApp {
                 }
                 self.project_path = Some(loaded.path.clone());
                 self.model = loaded.data.model;
+                self.fem = loaded.data.fem;
+                self.fem_window.open = false;
                 self.table_editor.close();
                 self.property_editor.close();
                 self.rigidity = loaded.data.rigidity;
@@ -306,6 +318,8 @@ impl MohrApp {
         self.table_editor.close();
         self.property_editor.close();
         self.model = StructuralModel::default();
+        self.fem = FemProject::default();
+        self.fem_window.open = false;
         self.rigidity = Rigidity::Symbolic;
         self.thermal_expansion = ThermalExpansion::Symbolic;
         self.effects = EffectsSelection::default();
@@ -322,6 +336,25 @@ impl MohrApp {
     fn show_top_toolbar(&mut self, root_ui: &mut egui::Ui) {
         let editor_open = self.table_editor.open || self.property_editor.open;
         egui::Panel::top("project_toolbar").show(root_ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!editor_open, |ui| {
+                    ui.menu_button("Настройки проекта", |ui| {
+                        if ui.button("Открыть…").clicked() { self.open_project_file(); ui.close(); }
+                        if ui.button("Сохранить").clicked() { self.save_project_file(); ui.close(); }
+                        if ui.button("Экспорт в Word").clicked() { self.export_word_report(); ui.close(); }
+                        if ui.button("Экспорт v0.5.0").clicked() { self.export_legacy_project(); ui.close(); }
+                        ui.separator();
+                        if ui.button("Очистить схему…").clicked() { self.confirm_clear = true; ui.close(); }
+                    });
+                    if ui.button("Настройка коэффициентов").clicked() {
+                        self.property_editor.open_with(&self.model);
+                    }
+                    if ui.button("Расчёт рамы МКЭ").clicked() {
+                        self.fem_window.open_with(&self.model, &mut self.fem);
+                    }
+                });
+            });
+            ui.separator();
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(
                     &mut self.active_tab,
@@ -359,39 +392,6 @@ impl MohrApp {
                     self.project_path = None;
                 }
                 ui.monospace(".mohr.ron");
-                if ui.add_enabled(!editor_open, egui::Button::new("Сохранить")).clicked() {
-                    self.save_project_file();
-                }
-                if ui
-                    .add_enabled(!editor_open, egui::Button::new("Открыть…"))
-                    .on_hover_text("Выбрать файл проекта *.mohr.ron в Finder или Проводнике")
-                    .clicked()
-                {
-                    self.open_project_file();
-                }
-                if ui.add_enabled(!editor_open, egui::Button::new("Экспорт Word")).clicked() {
-                    self.export_word_report();
-                }
-                if ui
-                    .add_enabled(!editor_open, egui::Button::new("Экспорт v0.5.0"))
-                    .on_hover_text(
-                        "Создать отдельную копию без mφ и масштаба холста, которую откроет v0.5.0",
-                    )
-                    .clicked()
-                {
-                    self.export_legacy_project();
-                }
-                if ui
-                    .add_enabled(!editor_open,
-                        egui::Button::new(
-                            RichText::new("Очистить схему").color(Color32::from_rgb(255, 225, 225)),
-                        )
-                        .fill(Color32::from_rgb(115, 42, 42)),
-                    )
-                    .clicked()
-                {
-                    self.confirm_clear = true;
-                }
                 let folder = self
                     .project_path
                     .as_deref()
@@ -550,11 +550,6 @@ impl MohrApp {
                 ui.heading("Узловая модель рамы");
                 ui.small("Сначала задайте точки, затем соедините их стержнями");
                 ui.separator();
-                if ui.button("Таблица жёсткостей и коэффициентов α…").clicked() {
-                    self.property_editor.open_with(&self.model);
-                }
-                ui.separator();
-
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -969,6 +964,7 @@ impl MohrApp {
                     self.model.supports.push(SupportMotion {
                         node,
                         direction: SupportDirection::Horizontal,
+                        normal_deg: 90.0,
                         displacement: 0.0,
                         unit_x_reaction: 0.0,
                         unit_y_reaction: 0.0,
@@ -998,7 +994,7 @@ impl MohrApp {
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Связи:");
-                                for direction in [SupportDirection::Horizontal, SupportDirection::Vertical, SupportDirection::Rotation] {
+                                for direction in [SupportDirection::Horizontal, SupportDirection::Vertical, SupportDirection::Rotation, SupportDirection::Normal] {
                                     let mut checked = self.model.supports.iter().any(|support| support.node == node_index && support.direction == direction);
                                     if ui.checkbox(&mut checked, direction.symbol()).changed() {
                                         toggle = Some((node_index, direction, checked));
@@ -1007,9 +1003,14 @@ impl MohrApp {
                             });
                             egui::Grid::new(("support_values", node_index)).striped(true).show(ui, |ui| {
                                 ui.strong("Связь"); ui.strong("c"); ui.strong("R для Δx"); ui.strong("R для Δy"); ui.strong("R для φ"); ui.end_row();
-                                for direction in [SupportDirection::Horizontal, SupportDirection::Vertical, SupportDirection::Rotation] {
+                                for direction in [SupportDirection::Horizontal, SupportDirection::Vertical, SupportDirection::Rotation, SupportDirection::Normal] {
                                     let Some(support) = self.model.supports.iter_mut().find(|support| support.node == node_index && support.direction == direction) else { continue; };
-                                    ui.label(direction.symbol());
+                                    if direction == SupportDirection::Normal {
+                                        ui.horizontal(|ui| {
+                                            ui.label("N, °");
+                                            ui.add(DragValue::new(&mut support.normal_deg).speed(1.0));
+                                        });
+                                    } else { ui.label(direction.symbol()); }
                                     ui.add(DragValue::new(&mut support.displacement).speed(0.01));
                                     ui.add(DragValue::new(&mut support.unit_x_reaction).speed(0.1));
                                     ui.add(DragValue::new(&mut support.unit_y_reaction).speed(0.1));
@@ -1029,7 +1030,7 @@ impl MohrApp {
                 } else if let Some((node, direction, checked)) = toggle {
                     if checked {
                         self.model.supports.push(SupportMotion {
-                            node, direction, displacement: 0.0,
+                            node, direction, normal_deg: 90.0, displacement: 0.0,
                             unit_x_reaction: 0.0, unit_y_reaction: 0.0, unit_rotation_reaction: 0.0,
                         });
                     } else {
@@ -1117,6 +1118,34 @@ impl eframe::App for MohrApp {
             self.clamp_selection();
             self.project_message = "Свойства стержней обновлены из таблицы".into();
             self.project_message_is_error = false;
+        }
+        if let Some(model) = self.fem_window.show(ui.ctx(), &self.model, &mut self.fem) {
+            self.model = model;
+            self.project_message =
+                "Эпюры и единичные реакции МКЭ переданы в основной расчёт".into();
+            self.project_message_is_error = false;
+        }
+        if let Some((result, sections)) = self.fem_window.take_report_request() {
+            let saved = build_fem_word_report(&self.model, &self.fem, &result, sections).and_then(
+                |bytes| match self.project_path.as_deref() {
+                    Some(path) => save_fem_word_report_for_path(path, &bytes),
+                    None => save_fem_word_report(&self.project_name, &bytes),
+                },
+            );
+            match saved {
+                Ok(path) => {
+                    self.project_message = format!("Отчёт МКЭ сохранён: {}", path.display());
+                    self.project_message_is_error = false;
+                    self.fem_window
+                        .report_status(self.project_message.clone(), false);
+                }
+                Err(error) => {
+                    self.project_message = format!("Экспорт МКЭ: {error}");
+                    self.project_message_is_error = true;
+                    self.fem_window
+                        .report_status(self.project_message.clone(), true);
+                }
+            }
         }
     }
 

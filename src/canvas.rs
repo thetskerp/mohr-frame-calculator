@@ -397,6 +397,11 @@ fn draw_supports(painter: &egui::Painter, model: &StructuralModel, transform: &C
                 ],
                 Vec2::new(10.0, -2.0),
             ),
+            SupportDirection::Normal => {
+                let a = support.normal_deg.to_radians();
+                let n = Vec2::new(a.cos() as f32, -a.sin() as f32);
+                ([point + n * 8.0, point + n * 20.0], n * 24.0)
+            }
         };
         painter.line_segment(line, Stroke::new(2.0, color));
         painter.text(
