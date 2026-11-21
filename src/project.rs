@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas::CanvasViewState;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 const PROJECT_FORMAT_ID: &str = "mohr-frame-project";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,7 +98,7 @@ fn save_project_with_paths(paths: &ProjectPaths, data: &ProjectData) -> Result<P
         format: PROJECT_FORMAT_ID.into(),
         schema_version: CURRENT_SCHEMA_VERSION,
         created_with: env!("CARGO_PKG_VERSION").into(),
-        minimum_reader: "0.8.0".into(),
+        minimum_reader: "0.8.1".into(),
         data: data.clone(),
     };
     let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::default())
@@ -194,6 +194,17 @@ pub fn export_for_v050_for_path(path: &Path, data: &ProjectData) -> Result<PathB
 
 fn export_for_v050_with_paths(paths: &ProjectPaths, data: &ProjectData) -> Result<PathBuf, String> {
     data.model.validate()?;
+    if data
+        .model
+        .rods
+        .iter()
+        .any(|rod| rod.release_start_moment || rod.release_end_moment)
+    {
+        return Err(
+            "экспорт v0.5.0 не поддерживает внутренние шарниры; сохраните проект в текущем формате"
+                .into(),
+        );
+    }
     let values = data
         .model
         .rods
@@ -500,6 +511,8 @@ mod tests {
                     id: "AB".into(),
                     start_node: 0,
                     end_node: 1,
+                    release_start_moment: false,
+                    release_end_moment: false,
                     rigidity_preset_id: None,
                     thermal_preset_id: None,
                     rigidity_factor: 1.0,
@@ -622,6 +635,26 @@ mod tests {
         let (restored, migrated) = deserialize_project_text(&text).unwrap();
         assert!(!migrated);
         assert_eq!(restored, data);
+    }
+
+    #[test]
+    fn v080_project_without_hinge_fields_opens_as_rigid_joints() {
+        let file = ProjectFileV2 {
+            format: PROJECT_FORMAT_ID.into(),
+            schema_version: 6,
+            created_with: "0.8.0".into(),
+            minimum_reader: "0.8.0".into(),
+            data: sample_data(),
+        };
+        let text = ron::ser::to_string(&file).unwrap();
+        assert!(text.contains("release_start_moment:false"));
+        let text = text
+            .replace("release_start_moment:false,", "")
+            .replace("release_end_moment:false,", "");
+        let (loaded, migrated) = deserialize_project_text(&text).unwrap();
+        assert!(migrated);
+        assert!(!loaded.model.rods[0].release_start_moment);
+        assert!(!loaded.model.rods[0].release_end_moment);
     }
 
     #[test]

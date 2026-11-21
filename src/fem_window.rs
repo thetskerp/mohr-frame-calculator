@@ -31,6 +31,7 @@ enum ResultTab {
     Check,
     Reactions,
     Diagrams,
+    Details,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Quantity {
@@ -150,7 +151,7 @@ pub struct FemWindow {
 #[derive(Debug, Clone, PartialEq)]
 struct GeometrySnapshot {
     nodes: Vec<(String, f64, f64)>,
-    rods: Vec<(String, usize, usize)>,
+    rods: Vec<(String, usize, usize, bool, bool)>,
 }
 
 impl GeometrySnapshot {
@@ -164,7 +165,15 @@ impl GeometrySnapshot {
             rods: model
                 .rods
                 .iter()
-                .map(|r| (r.id.clone(), r.start_node, r.end_node))
+                .map(|r| {
+                    (
+                        r.id.clone(),
+                        r.start_node,
+                        r.end_node,
+                        r.release_start_moment,
+                        r.release_end_moment,
+                    )
+                })
                 .collect(),
         }
     }
@@ -194,7 +203,7 @@ impl FemWindow {
     pub fn show(
         &mut self,
         ctx: &egui::Context,
-        model: &StructuralModel,
+        model: &mut StructuralModel,
         input: &mut FemProject,
     ) -> Option<StructuralModel> {
         if !self.open {
@@ -217,6 +226,7 @@ impl FemWindow {
             .min_size([520.0, 400.0])
             .show(ctx, |ui| {
                 let before = input.clone();
+                let before_geometry = GeometrySnapshot::of(model);
                 ui.horizontal_wrapped(|ui| {
                     ui.strong("Геометрия из текущего проекта");
                     if !input.is_aligned(model) && ui.button("Обновить модель").clicked()
@@ -319,6 +329,7 @@ impl FemWindow {
                                 ResultTab::Diagrams,
                                 "Эпюры M, N, Q",
                             );
+                            ui.selectable_value(&mut self.tab, ResultTab::Details, "Ход расчёта");
                             if self.result.is_some()
                                 && ui.button("Передать эпюры и реакции").clicked()
                             {
@@ -367,7 +378,7 @@ impl FemWindow {
                             .show(ui, |ui| self.results(ui, model, input, results_height));
                     }
                 }
-                if *input != before {
+                if *input != before || GeometrySnapshot::of(model) != before_geometry {
                     self.result = None;
                     self.solved_geometry = None;
                     self.message = "Данные изменены — повторите расчёт".into();
@@ -407,7 +418,7 @@ impl FemWindow {
         self.error = error;
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui, model: &StructuralModel, input: &mut FemProject) {
+    fn sidebar(&mut self, ui: &mut egui::Ui, model: &mut StructuralModel, input: &mut FemProject) {
         ui.heading("Объекты рамы");
         ui.horizontal(|ui| {
             if ui
@@ -501,7 +512,12 @@ impl FemWindow {
             }
         }
     }
-    fn properties(&mut self, ui: &mut egui::Ui, model: &StructuralModel, input: &mut FemProject) {
+    fn properties(
+        &mut self,
+        ui: &mut egui::Ui,
+        model: &mut StructuralModel,
+        input: &mut FemProject,
+    ) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -540,6 +556,13 @@ impl FemWindow {
                             return;
                         };
                         ui.heading(format!("Стержень {}", member.id));
+                        if let Some(rod) = model.rods.get_mut(self.selected_member) {
+                            ui.checkbox(&mut rod.release_start_moment, "Шарнир в начале");
+                            ui.checkbox(&mut rod.release_end_moment, "Шарнир в конце");
+                            ui.small(
+                                "Один из двух стержней в общей точке должен освобождать момент.",
+                            );
+                        }
                         ui.small("Для статически определимой рамы EA и EI оставьте пустыми.");
                         ui.collapsing(
                             "Численные жёсткости для неопределимой рамы",
@@ -685,6 +708,54 @@ impl FemWindow {
                 let controls_height = ui.cursor().top() - content_top;
                 let epure_height = (viewport_height - controls_height - 8.0).max(200.0);
                 draw_epure(ui, model, case, self.quantity, epure_height, &mut self.view);
+            }
+            ResultTab::Details => {
+                select_case(ui, result, &mut self.case_index);
+                let case = selected_case(result, self.case_index);
+                let unit =
+                    (self.case_index > 0).then(|| result.units[self.case_index - 1].component);
+                ui.heading("Опорные реакции по равновесию узлов");
+                ui.small("Для каждой оси: R = Σ концевых усилий стержней − узловая нагрузка. Нулевые слагаемые показаны.");
+                for step in case.reaction_steps(model, input, unit) {
+                    ui.collapsing(format!("Узел {}", step.node_id), |ui| {
+                        for (name, i) in [("Rₓ", 0), ("Rᵧ", 1), ("Mᶻ", 2)] {
+                            ui.monospace(format!(
+                                "{name} = {} − {} = {}",
+                                format_number(step.member_end_forces[i]),
+                                format_number(step.applied_load[i]),
+                                format_number(step.reaction[i])
+                            ));
+                        }
+                    });
+                }
+                ui.separator();
+                ui.heading("Расчёт эпюр по сечениям стержней");
+                ui.small("x отсчитывается от начала стержня; H(x−a) описывает скачок в точке приложения силы или момента.");
+                for (rod, member) in model.rods.iter().zip(&case.members) {
+                    ui.collapsing(
+                        format!("{} · L={}", rod.id, format_number(member.length)),
+                        |ui| {
+                            for formula in member.calculation_formulas() {
+                                ui.monospace(formula);
+                            }
+                            egui::Grid::new(("fem_detail", &rod.id))
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for label in ["x", "N", "Q", "M"] {
+                                        ui.strong(label);
+                                    }
+                                    ui.end_row();
+                                    for (label, section) in member.calculation_samples() {
+                                        ui.label(label);
+                                        for value in [section.n, section.q, section.m] {
+                                            ui.monospace(format_number(value));
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        },
+                    );
+                }
             }
         }
     }
@@ -892,7 +963,12 @@ fn draw_model(
         } else {
             Color32::WHITE
         };
-        painter.circle_filled(p, 5.0, color);
+        if model.is_internal_hinge_node(i) {
+            painter.circle_filled(p, 7.0, Color32::from_rgb(18, 25, 34));
+            painter.circle_stroke(p, 7.0, Stroke::new(2.0, color));
+        } else {
+            painter.circle_filled(p, 5.0, color);
+        }
         painter.text(
             p + Vec2::new(9.0, -9.0),
             Align2::LEFT_CENTER,
@@ -1032,7 +1108,12 @@ fn draw_reactions(
         .enumerate()
     {
         let p = view.point(node.position.x, node.position.y);
-        painter.circle_filled(p, 4.0, Color32::WHITE);
+        if model.is_internal_hinge_node(i) {
+            painter.circle_filled(p, 7.0, Color32::from_rgb(18, 25, 34));
+            painter.circle_stroke(p, 7.0, Stroke::new(2.0, Color32::WHITE));
+        } else {
+            painter.circle_filled(p, 4.0, Color32::WHITE);
+        }
         painter.text(
             p + Vec2::new(9.0, -10.0),
             Align2::LEFT_CENTER,
@@ -1342,6 +1423,13 @@ fn draw_epure(
                 FontId::monospace(10.0),
                 color,
             );
+        }
+    }
+    for (index, node) in model.nodes.iter().enumerate() {
+        if model.is_internal_hinge_node(index) {
+            let p = view.point(node.position.x, node.position.y);
+            painter.circle_filled(p, 7.0, Color32::from_rgb(18, 25, 34));
+            painter.circle_stroke(p, 7.0, Stroke::new(2.0, Color32::WHITE));
         }
     }
 }

@@ -559,6 +559,9 @@ impl MohrApp {
                         if let Err(error) = self.model.validate_unique_geometry() {
                             ui.colored_label(Color32::LIGHT_RED, error);
                         }
+                        if let Err(error) = self.model.validate_hinges() {
+                            ui.colored_label(Color32::LIGHT_RED, error);
+                        }
                         ui.separator();
                         ui.checkbox(&mut self.show_values, "Показывать ординаты");
                         if tab == WorkspaceTab::ForceDisplacement {
@@ -1119,7 +1122,10 @@ impl eframe::App for MohrApp {
             self.project_message = "Свойства стержней обновлены из таблицы".into();
             self.project_message_is_error = false;
         }
-        if let Some(model) = self.fem_window.show(ui.ctx(), &self.model, &mut self.fem) {
+        if let Some(model) = self
+            .fem_window
+            .show(ui.ctx(), &mut self.model, &mut self.fem)
+        {
             self.model = model;
             self.project_message =
                 "Эпюры и единичные реакции МКЭ переданы в основной расчёт".into();
@@ -1390,6 +1396,19 @@ fn rod_editor(
             format_number(length),
             orientation
         ));
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut rod.release_start_moment,
+                format!("Шарнир в начале ({})", start.id),
+            );
+            ui.checkbox(
+                &mut rod.release_end_moment,
+                format!("Шарнир в конце ({})", end.id),
+            );
+        });
+        ui.small(
+            "Внутренний шарнир: два стержня в одной точке, освобождение момента у одного конца.",
+        );
         let presets = if tab == WorkspaceTab::ThermalDisplacement {
             thermal_presets
         } else {
@@ -1761,6 +1780,8 @@ fn default_model() -> StructuralModel {
             id: "AB".into(),
             start_node: 0,
             end_node: 1,
+            release_start_moment: false,
+            release_end_moment: false,
             rigidity_preset_id: None,
             thermal_preset_id: None,
             rigidity_factor: 1.0,
@@ -1797,6 +1818,8 @@ fn migrate_legacy_frame(frame: Frame) -> StructuralModel {
             id: segment.id,
             start_node,
             end_node,
+            release_start_moment: false,
+            release_end_moment: false,
             rigidity_preset_id: None,
             thermal_preset_id: None,
             rigidity_factor: segment.rigidity_factor,

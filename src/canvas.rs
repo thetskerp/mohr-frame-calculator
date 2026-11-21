@@ -359,7 +359,12 @@ fn draw_nodes(painter: &egui::Painter, model: &StructuralModel, transform: &Canv
         } else {
             Color32::WHITE
         };
-        painter.circle_filled(point, if is_target { 5.5 } else { 4.0 }, color);
+        if model.is_internal_hinge_node(index) {
+            painter.circle_filled(point, 6.0, Color32::from_rgb(18, 22, 29));
+            painter.circle_stroke(point, 6.0, Stroke::new(2.0, color));
+        } else {
+            painter.circle_filled(point, if is_target { 5.5 } else { 4.0 }, color);
+        }
         if is_target {
             painter.circle_stroke(point, 9.0, Stroke::new(1.5, color));
         }

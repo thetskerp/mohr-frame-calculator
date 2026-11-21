@@ -208,13 +208,20 @@ impl FemResult {
                 .find(|u| u.component == component)
                 .map(|u| &u.result)
         };
-        let x = find(UnitComponent::X)
-            .ok_or("Для передачи включите все три единичные системы: X, Y и φ")?;
-        let y = find(UnitComponent::Y)
-            .ok_or("Для передачи включите все три единичные системы: X, Y и φ")?;
-        let rotation = find(UnitComponent::Rotation)
-            .ok_or("Для передачи включите все три единичные системы: X, Y и φ")?;
+        let x = find(UnitComponent::X).ok_or("Для передачи включите единичную систему X")?;
+        let y = find(UnitComponent::Y).ok_or("Для передачи включите единичную систему Y")?;
+        let target_index = model
+            .nodes
+            .iter()
+            .position(|n| n.id == input.target_node_id)
+            .ok_or("Искомая точка МКЭ не найдена в раме")?;
+        let target_is_hinge = model.is_internal_hinge_node(target_index);
+        let rotation = find(UnitComponent::Rotation);
+        if rotation.is_none() && !target_is_hinge {
+            return Err("Для передачи включите единичную систему φ".into());
+        }
         let mut updated = model.clone();
+        updated.target_node = target_index;
         for (i, rod) in updated.rods.iter_mut().enumerate() {
             let actual = &self.actual.members[i];
             rod.load_diagram = moment_diagram(actual)?;
@@ -222,23 +229,28 @@ impl FemResult {
             rod.shear_diagram = linear_diagram(actual.at(0.0).q, actual.at(actual.length).q)?;
             for (case, m, n) in [
                 (
-                    &x.members[i],
+                    Some(&x.members[i]),
                     &mut rod.unit_x_diagram,
                     &mut rod.unit_normal_x_diagram,
                 ),
                 (
-                    &y.members[i],
+                    Some(&y.members[i]),
                     &mut rod.unit_y_diagram,
                     &mut rod.unit_normal_y_diagram,
                 ),
                 (
-                    &rotation.members[i],
+                    rotation.map(|result| &result.members[i]),
                     &mut rod.unit_rotation_diagram,
                     &mut rod.unit_normal_rotation_diagram,
                 ),
             ] {
-                *m = moment_diagram(case)?;
-                *n = linear_diagram(case.at(0.0).n, case.at(case.length).n)?;
+                if let Some(case) = case {
+                    *m = moment_diagram(case)?;
+                    *n = linear_diagram(case.at(0.0).n, case.at(case.length).n)?;
+                } else {
+                    *m = Diagram::default();
+                    *n = Diagram::default();
+                }
             }
             if self.stiffness_mode == StiffnessMode::Numeric {
                 let ei = input.members[i].ei;
@@ -325,7 +337,7 @@ impl FemResult {
                     displacement,
                     unit_x_reaction: projection(x),
                     unit_y_reaction: projection(y),
-                    unit_rotation_reaction: projection(rotation),
+                    unit_rotation_reaction: rotation.map_or(0.0, projection),
                 });
             }
         }
@@ -382,6 +394,133 @@ impl MemberResult {
             }
         }
         SectionForces { n, q, m }
+    }
+
+    /// Формулы эпюр в локальной координате x, 0 ≤ x ≤ L. H(x−a) равна
+    /// нулю слева от сосредоточенного воздействия и единице справа.
+    pub fn calculation_formulas(&self) -> [String; 3] {
+        let number = crate::format_number;
+        let mut n = format!(
+            "N(x) = −({}) − ({})·x",
+            number(self.end_forces[0]),
+            number(self.qx_local)
+        );
+        let mut q = format!(
+            "Q(x) = −({}) − ({})·x",
+            number(self.end_forces[1]),
+            number(self.qy_local)
+        );
+        let mut m = format!(
+            "M(x) = −({}) + ({})·x + ({})·x²/2",
+            number(self.end_forces[2]),
+            number(self.end_forces[1]),
+            number(self.qy_local)
+        );
+        for p in &self.point_loads_local {
+            let a = number(p.xi * self.length);
+            n.push_str(&format!(" − ({})·H(x−{a})", number(p.fx)));
+            q.push_str(&format!(" − ({})·H(x−{a})", number(p.fy)));
+            m.push_str(&format!(
+                " + [({})·(x−{a}) − ({})]·H(x−{a})",
+                number(p.fy),
+                number(p.mz)
+            ));
+        }
+        [n, q, m]
+    }
+
+    /// Характерные сечения, включая обе стороны скачка и внутренние экстремумы M.
+    pub fn calculation_samples(&self) -> Vec<(String, SectionForces)> {
+        let mut positions = vec![
+            (0.0, "0".to_string()),
+            (self.length / 2.0, "L/2".to_string()),
+            (self.length, "L".to_string()),
+        ];
+        let mut breaks = vec![0.0, self.length];
+        for p in &self.point_loads_local {
+            let a = p.xi * self.length;
+            breaks.push(a);
+            if a > 0.0 && a < self.length {
+                let epsilon = self.length.max(1.0) * 1e-8;
+                positions.push((
+                    (a - epsilon).max(0.0),
+                    format!("{}−", crate::format_number(a)),
+                ));
+                positions.push((a, format!("{}+", crate::format_number(a))));
+            }
+        }
+        if self.qy_local.abs() > 1e-12 {
+            breaks.sort_by(f64::total_cmp);
+            breaks.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
+            for pair in breaks.windows(2) {
+                let middle = (pair[0] + pair[1]) / 2.0;
+                let slope = self.at(middle).q + self.qy_local * middle;
+                let x = slope / self.qy_local;
+                if x > pair[0] + 1e-9 && x < pair[1] - 1e-9 {
+                    positions.push((x, format!("экстремум x={}", crate::format_number(x))));
+                }
+            }
+        }
+        positions.sort_by(|a, b| a.0.total_cmp(&b.0));
+        positions
+            .into_iter()
+            .map(|(x, label)| (label, self.at(x)))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeReactionStep {
+    pub node_id: String,
+    pub member_end_forces: [f64; 3],
+    pub applied_load: [f64; 3],
+    pub reaction: [f64; 3],
+}
+
+impl LoadCaseResult {
+    /// Узловой баланс: R = сумма концевых усилий стержней − узловая нагрузка.
+    pub fn reaction_steps(
+        &self,
+        model: &StructuralModel,
+        input: &FemProject,
+        unit: Option<UnitComponent>,
+    ) -> Vec<NodeReactionStep> {
+        let mut sums = vec![[0.0; 3]; model.nodes.len()];
+        for (rod, member) in model.rods.iter().zip(&self.members) {
+            let a = model.nodes[rod.start_node].position;
+            let b = model.nodes[rod.end_node].position;
+            let c = (b.x - a.x) / member.length;
+            let s = (b.y - a.y) / member.length;
+            for (node, offset) in [(rod.start_node, 0), (rod.end_node, 3)] {
+                let f = &member.end_forces;
+                sums[node][0] += c * f[offset] - s * f[offset + 1];
+                sums[node][1] += s * f[offset] + c * f[offset + 1];
+                sums[node][2] += f[offset + 2];
+            }
+        }
+        model
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                let applied_load = if let Some(component) = unit {
+                    let mut load = [0.0; 3];
+                    if node.id == input.target_node_id {
+                        load[component.index()] = 1.0;
+                    }
+                    load
+                } else {
+                    let load = &input.nodes[index];
+                    [load.fx, load.fy, load.mz]
+                };
+                NodeReactionStep {
+                    node_id: node.id.clone(),
+                    member_end_forces: sums[index],
+                    applied_load,
+                    reaction: self.reactions[index],
+                }
+            })
+            .collect()
     }
 }
 
@@ -451,6 +590,17 @@ impl FemProject {
                 "Геометрия изменилась: обновите модель МКЭ, проверив сохранённые нагрузки".into(),
             );
         }
+        for (index, node) in self.nodes.iter().enumerate() {
+            if model.is_internal_hinge_node(index)
+                && (node.mz.abs() > 1e-12
+                    || matches!(node.support, SupportKind::Fixed | SupportKind::Guided))
+            {
+                return Err(format!(
+                    "точка {}: внутренний шарнир не допускает узловой момент или закрепление поворота",
+                    node.id
+                ));
+            }
+        }
         for member in &self.members {
             for (name, value) in [("EA", member.ea), ("EI", member.ei)] {
                 if !value.is_finite() || value < 0.0 {
@@ -477,8 +627,14 @@ impl FemProject {
             }
         }
         let prepared = Prepared::new(model, &normalized)?;
+        let releases = model
+            .rods
+            .iter()
+            .map(|rod| rod.release_start_moment as isize + rod.release_end_moment as isize)
+            .sum::<isize>();
         let redundancy = prepared.constraints.len() as isize + 3 * model.rods.len() as isize
-            - 3 * model.nodes.len() as isize;
+            - 3 * model.nodes.len() as isize
+            - releases;
         if !numeric && redundancy < 0 {
             return Err(
                 "рама имеет недостаточно связей для статически определимого расчёта".into(),
@@ -495,6 +651,9 @@ impl FemProject {
             .iter()
             .position(|n| n.id == self.target_node_id)
             .ok_or("Выберите точку для единичных эпюр")?;
+        if model.is_internal_hinge_node(target) && self.units.rotation {
+            return Err("внутренний шарнир имеет два независимых поворота: снимите галочку единичного момента φ или выберите другую точку".into());
+        }
         let mut units = Vec::new();
         for (enabled, component) in [
             (self.units.x, UnitComponent::X),
@@ -542,7 +701,8 @@ fn validate_geometry(model: &StructuralModel) -> Result<(), String> {
             return Err(format!("стержень {} имеет нулевую длину", rod.id));
         }
     }
-    model.validate_unique_geometry()
+    model.validate_unique_geometry()?;
+    model.validate_hinges()
 }
 
 struct Element {
@@ -550,7 +710,10 @@ struct Element {
     length: f64,
     c: f64,
     s: f64,
+    k_full: [[f64; 6]; 6],
     k_local: [[f64; 6]; 6],
+    release_start_moment: bool,
+    release_end_moment: bool,
 }
 struct Prepared {
     n: usize,
@@ -587,6 +750,41 @@ fn local_stiffness(ea: f64, ei: f64, l: f64) -> [[f64; 6]; 6] {
         [0.0, -b, -c, 0.0, b, -c],
         [0.0, c, e, 0.0, -c, d],
     ]
+}
+
+/// Исключает свободный поворот конца из локальной матрицы и вектора
+/// эквивалентных нагрузок. Осевые и поперечные степени свободы сохраняются.
+fn condense_moment_releases(
+    mut k: [[f64; 6]; 6],
+    mut f: [f64; 6],
+    start: bool,
+    end: bool,
+) -> ([[f64; 6]; 6], [f64; 6]) {
+    for (released, r) in [(start, 2), (end, 5)] {
+        if !released {
+            continue;
+        }
+        let pivot = k[r][r];
+        let pivot_row = k[r];
+        for (i, row) in k.iter_mut().enumerate() {
+            if i == r {
+                continue;
+            }
+            let factor = row[r] / pivot;
+            f[i] -= factor * f[r];
+            for (j, value) in row.iter_mut().enumerate() {
+                if j != r {
+                    *value -= factor * pivot_row[j];
+                }
+            }
+        }
+        for row in &mut k {
+            row[r] = 0.0;
+        }
+        k[r] = [0.0; 6];
+        f[r] = 0.0;
+    }
+    (k, f)
 }
 
 fn solve_linear(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Result<Vec<f64>, ()> {
@@ -645,7 +843,13 @@ impl Prepared {
             }
             let c = (b.x - a.x) / length;
             let s = (b.y - a.y) / length;
-            let kl = local_stiffness(member.ea, member.ei, length);
+            let k_full = local_stiffness(member.ea, member.ei, length);
+            let (kl, _) = condense_moment_releases(
+                k_full,
+                [0.0; 6],
+                rod.release_start_moment,
+                rod.release_end_moment,
+            );
             let dofs = [
                 rod.start_node * 3,
                 rod.start_node * 3 + 1,
@@ -670,7 +874,10 @@ impl Prepared {
                 length,
                 c,
                 s,
+                k_full,
                 k_local: kl,
+                release_start_moment: rod.release_start_moment,
+                release_end_moment: rod.release_end_moment,
             });
         }
         let mut constraints = Vec::new();
@@ -788,6 +995,12 @@ impl Prepared {
                     });
                 }
             }
+            let (_, fe) = condense_moment_releases(
+                element.k_full,
+                fe,
+                element.release_start_moment,
+                element.release_end_moment,
+            );
             for i in 0..6 {
                 let mut value = 0.0;
                 for (j, local) in fe.iter().enumerate() {
@@ -1246,5 +1459,80 @@ mod tests {
         input.nodes[1].support = SupportKind::Roller;
         input.nodes[1].normal_deg = 0.0;
         assert!(input.solve(&model).unwrap_err().contains("вырождена"));
+    }
+
+    #[test]
+    fn internal_end_hinge_releases_both_sides_of_moment() {
+        let (mut model, mut input) = beam(2.0);
+        model.nodes.push(Node {
+            id: "B".into(),
+            position: Point { x: 4.0, y: 0.0 },
+        });
+        model.nodes[1].id = "H".into();
+        model.rods[0].release_end_moment = true;
+        model.rods.push(Rod::blank("HB".into(), 1, 2));
+        model.target_node = 2;
+        input.reconcile(&model);
+        input.target_node_id = "B".into();
+        input.nodes[0].support = SupportKind::Fixed;
+        input.nodes[2].support = SupportKind::Roller;
+        input.members[1].qy = -5.0;
+        let numeric = input.solve(&model).unwrap();
+        near(numeric.actual.members[0].at(2.0).m, 0.0);
+        near(numeric.actual.members[1].at(0.0).m, 0.0);
+        near(numeric.actual.members[1].at(2.0).m, 0.0);
+        near(numeric.actual.members[1].at(1.0).m, 2.5);
+        near(numeric.actual.reactions[0][1], 5.0);
+        near(numeric.actual.reactions[2][1], 5.0);
+        for step in numeric.actual.reaction_steps(&model, &input, None) {
+            for i in 0..3 {
+                near(
+                    step.member_end_forces[i] - step.applied_load[i],
+                    step.reaction[i],
+                );
+            }
+        }
+        for member in &mut input.members {
+            member.ea = 0.0;
+            member.ei = 0.0;
+        }
+        let symbolic = input.solve(&model).unwrap();
+        assert_eq!(symbolic.stiffness_mode, StiffnessMode::Determinate);
+        near(symbolic.actual.members[1].at(1.0).m, 2.5);
+        input.target_node_id = "H".into();
+        input.units.rotation = false;
+        let hinge_translation = input.solve(&model).unwrap();
+        let transferred = hinge_translation.apply_to_model(&model, &input).unwrap();
+        assert_eq!(transferred.target_node, 1);
+        assert_eq!(
+            transferred.rods[0].unit_rotation_diagram,
+            Diagram::default()
+        );
+    }
+
+    #[test]
+    fn hinge_rejects_ambiguous_or_unstable_configuration() {
+        let (mut model, mut input) = beam(2.0);
+        model.nodes.push(Node {
+            id: "C".into(),
+            position: Point { x: 4.0, y: 0.0 },
+        });
+        model.rods[0].release_end_moment = true;
+        model.rods.push(Rod::blank("BC".into(), 1, 2));
+        model.target_node = 2;
+        input.reconcile(&model);
+        input.target_node_id = "C".into();
+        input.nodes[0].support = SupportKind::Pin;
+        input.nodes[2].support = SupportKind::Roller;
+        assert!(input.solve(&model).is_err());
+        input.nodes[0].support = SupportKind::Fixed;
+        input.nodes[1].mz = 1.0;
+        assert!(input.solve(&model).unwrap_err().contains("узловой момент"));
+        input.nodes[1].mz = 0.0;
+        model.rods[1].release_start_moment = true;
+        assert!(input
+            .solve(&model)
+            .unwrap_err()
+            .contains("ровно два стержня"));
     }
 }

@@ -112,7 +112,7 @@ impl TableEditor {
                             self.message.clear();
                         }
                         egui::Grid::new("table_rods").striped(true).show(ui, |ui| {
-                            ui.strong("№"); ui.strong("Стержень"); ui.strong("Начало"); ui.strong("Конец"); ui.strong("L"); ui.end_row();
+                            ui.strong("№"); ui.strong("Стержень"); ui.strong("Начало"); ui.strong("Конец"); ui.strong("L"); ui.strong("Шарнир в начале"); ui.strong("Шарнир в конце"); ui.end_row();
                             for (index, rod) in draft.rods.iter_mut().enumerate() {
                                 ui.label((index + 1).to_string());
                                 ui.add(egui::TextEdit::singleline(&mut rod.id).desired_width(65.0));
@@ -121,6 +121,8 @@ impl TableEditor {
                                 let length = draft.nodes.get(rod.start_node).zip(draft.nodes.get(rod.end_node))
                                     .map(|(a, b)| (a.position.x - b.position.x).hypot(a.position.y - b.position.y));
                                 ui.label(length.map_or_else(|| "—".into(), mohr_frame::format_number));
+                                ui.checkbox(&mut rod.release_start_moment, "");
+                                ui.checkbox(&mut rod.release_end_moment, "");
                                 ui.end_row();
                             }
                         });

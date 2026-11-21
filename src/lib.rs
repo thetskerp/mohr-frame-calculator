@@ -516,6 +516,12 @@ pub struct Rod {
     pub id: String,
     pub start_node: usize,
     pub end_node: usize,
+    /// Освобождение изгибающего момента на начальном конце стержня.
+    #[serde(default)]
+    pub release_start_moment: bool,
+    /// Освобождение изгибающего момента на конечном конце стержня.
+    #[serde(default)]
+    pub release_end_moment: bool,
     #[serde(default)]
     pub rigidity_preset_id: Option<u32>,
     #[serde(default)]
@@ -562,6 +568,8 @@ impl Rod {
             id,
             start_node,
             end_node,
+            release_start_moment: false,
+            release_end_moment: false,
             rigidity_preset_id: None,
             thermal_preset_id: None,
             rigidity_factor: 1.0,
@@ -746,6 +754,51 @@ pub enum DisplacementDirection {
 }
 
 impl StructuralModel {
+    /// Узел внутреннего шарнира: один из двух примыкающих стержней
+    /// не передаёт изгибающий момент.
+    pub fn is_internal_hinge_node(&self, node: usize) -> bool {
+        self.rods.iter().any(|rod| {
+            (rod.start_node == node && rod.release_start_moment)
+                || (rod.end_node == node && rod.release_end_moment)
+        })
+    }
+
+    pub fn validate_hinges(&self) -> Result<(), String> {
+        for (index, node) in self.nodes.iter().enumerate() {
+            let incident = self
+                .rods
+                .iter()
+                .filter(|rod| rod.start_node == index || rod.end_node == index)
+                .count();
+            if !self.is_internal_hinge_node(index) {
+                continue;
+            }
+            let releases = self
+                .rods
+                .iter()
+                .filter(|rod| {
+                    (rod.start_node == index && rod.release_start_moment)
+                        || (rod.end_node == index && rod.release_end_moment)
+                })
+                .count();
+            if incident != 2 || releases != 1 {
+                return Err(format!(
+                    "в точке {} внутренний шарнир требует ровно два стержня и освобождение момента только у одного из них",
+                    node.id
+                ));
+            }
+            if self.supports.iter().any(|support| {
+                support.node == index && support.direction == SupportDirection::Rotation
+            }) {
+                return Err(format!(
+                    "в точке {} нельзя одновременно задать внутренний шарнир и опору по повороту",
+                    node.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.validate_for_loading()?;
         self.validate_unique_geometry()
@@ -964,6 +1017,7 @@ impl StructuralModel {
             rod.unit_normal_y_diagram.validate()?;
             rod.unit_normal_rotation_diagram.validate()?;
         }
+        self.validate_hinges()?;
         Ok(())
     }
 
@@ -1852,6 +1906,8 @@ mod tests {
                 id: "AB".into(),
                 start_node: 0,
                 end_node: 1,
+                release_start_moment: false,
+                release_end_moment: false,
                 rigidity_preset_id: None,
                 thermal_preset_id: None,
                 rigidity_factor: 1.0,
@@ -2075,6 +2131,8 @@ mod tests {
                 id: "AB".into(),
                 start_node: 0,
                 end_node: 1,
+                release_start_moment: false,
+                release_end_moment: false,
                 rigidity_preset_id: None,
                 thermal_preset_id: None,
                 rigidity_factor: 1.0,
