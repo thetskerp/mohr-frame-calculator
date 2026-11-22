@@ -1,8 +1,8 @@
 //! Линейный МКЭ плоской рамы: элемент Эйлера — Бернулли, 3 СС в узле.
 
 use crate::{
-    Diagram, DiagramKind, FiberSide, Ordinate, PropertyPreset, PropertyValue, StructuralModel,
-    SupportDirection, SupportMotion,
+    round_for_calculation, Diagram, DiagramKind, FiberSide, Ordinate, PropertyPreset,
+    PropertyValue, StructuralModel, SupportDirection, SupportMotion,
 };
 use serde::{Deserialize, Serialize};
 
@@ -191,6 +191,44 @@ pub struct MemberResult {
 }
 
 impl FemResult {
+    /// Округление выполняется после решения СЛАУ, перед передачей в метод Мора.
+    /// Исходные нагрузки, EA, EI и сохранённый результат МКЭ не меняются.
+    pub fn apply_to_model_with_rounding(
+        &self,
+        model: &StructuralModel,
+        input: &FemProject,
+        decimals: Option<u8>,
+    ) -> Result<StructuralModel, String> {
+        let Some(decimals) = decimals else {
+            return self.apply_to_model(model, input);
+        };
+        let mut rounded = self.clone();
+        for case in std::iter::once(&mut rounded.actual)
+            .chain(rounded.units.iter_mut().map(|unit| &mut unit.result))
+        {
+            for reaction in &mut case.reactions {
+                for value in reaction {
+                    *value = round_for_calculation(*value, Some(decimals));
+                }
+            }
+            for member in &mut case.members {
+                for value in &mut member.end_forces {
+                    *value = round_for_calculation(*value, Some(decimals));
+                }
+            }
+        }
+        let mut updated = rounded.apply_to_model(model, input)?;
+        for support in &mut updated.supports {
+            support.unit_x_reaction =
+                round_for_calculation(support.unit_x_reaction, Some(decimals));
+            support.unit_y_reaction =
+                round_for_calculation(support.unit_y_reaction, Some(decimals));
+            support.unit_rotation_reaction =
+                round_for_calculation(support.unit_rotation_reaction, Some(decimals));
+        }
+        Ok(updated)
+    }
+
     /// Передаёт эпюры в ручной метод Мора без изменения исходной модели при ошибке.
     /// Одна `Diagram` не хранит скачки от силы внутри стержня: для них передача
     /// запрещена, хотя самостоятельный МКЭ их рассчитывает и рисует.
@@ -1147,6 +1185,20 @@ mod tests {
         assert_eq!(updated.rods[0].rigidity_preset_id, Some(1));
         assert!(!updated.rigidity_presets[0].value.numeric);
         near(updated.rigidity_presets[0].value.symbolic_factor, 2.0);
+    }
+
+    #[test]
+    fn transfer_rounds_for_classroom_mode_without_changing_fem_solution() {
+        let (model, mut input) = beam(2.0);
+        input.nodes[0].support = SupportKind::Fixed;
+        input.nodes[1].fy = -5.123;
+        let result = input.solve(&model).unwrap();
+        near(result.actual.members[0].at(0.0).m, -10.246);
+        let rounded = result
+            .apply_to_model_with_rounding(&model, &input, Some(2))
+            .unwrap();
+        near(rounded.rods[0].load_diagram.left_value(), -10.25);
+        near(result.actual.members[0].at(0.0).m, -10.246);
     }
 
     #[test]

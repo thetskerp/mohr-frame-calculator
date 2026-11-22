@@ -1,6 +1,6 @@
 //! Отдельное окно для нагрузок, опор, решения МКЭ и просмотра эпюр.
 
-use crate::canvas::CanvasCamera;
+use crate::canvas::{position_epure_label, CanvasCamera, EpureLabelSpec};
 use crate::docx_report::FemReportSections;
 use eframe::egui::{
     self, Align2, Color32, ComboBox, CursorIcon, DragValue, FontId, PointerButton, Pos2, Rect,
@@ -12,6 +12,23 @@ use mohr_frame::{
     },
     format_number, StructuralModel,
 };
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ReactionDisplay {
+    #[default]
+    Global,
+    Actual,
+}
+
+impl ReactionDisplay {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Global => "По глобальным осям",
+            Self::Actual => "Фактическая",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Selected {
@@ -205,6 +222,8 @@ impl FemWindow {
         ctx: &egui::Context,
         model: &mut StructuralModel,
         input: &mut FemProject,
+        decimals: Option<u8>,
+        reaction_display: ReactionDisplay,
     ) -> Option<StructuralModel> {
         if !self.open {
             return None;
@@ -375,7 +394,7 @@ impl FemWindow {
                         let results_height = ui.available_height();
                         egui::ScrollArea::both()
                             .auto_shrink([false, false])
-                            .show(ui, |ui| self.results(ui, model, input, results_height));
+                            .show(ui, |ui| self.results(ui, model, input, results_height, reaction_display));
                     }
                 }
                 if *input != before || GeometrySnapshot::of(model) != before_geometry {
@@ -388,7 +407,7 @@ impl FemWindow {
         self.open = open;
         if transfer {
             if let Some(result) = &self.result {
-                match result.apply_to_model(model, input) {
+                match result.apply_to_model_with_rounding(model, input, decimals) {
                     Ok(updated) => {
                         self.message = if result.stiffness_mode == StiffnessMode::Determinate {
                             "Эпюры и единичные реакции переданы; аналитическое EI сохранено".into()
@@ -630,6 +649,7 @@ impl FemWindow {
         model: &StructuralModel,
         input: &FemProject,
         viewport_height: f32,
+        reaction_display: ReactionDisplay,
     ) {
         let Some(result) = self.result.as_ref() else {
             ui.small("Задайте опоры и нагрузки, затем выполните расчёт. EA и EI нужны только для статически неопределимой рамы.");
@@ -653,10 +673,21 @@ impl FemWindow {
                     select_case(ui, result, &mut self.case_index);
                 });
                 let case = selected_case(result, self.case_index);
-                ui.small("Голубые стрелки показывают направление реакций; круговая стрелка — знак опорного момента.");
+                ui.small(match reaction_display {
+                    ReactionDisplay::Global => "Стрелки показывают положительные глобальные направления; знак подписи задаёт фактическое направление.",
+                    ReactionDisplay::Actual => "Стрелки показывают фактическое направление; подписи содержат модули реакций.",
+                });
                 let controls_height = ui.cursor().top() - content_top;
                 let canvas_height = ((viewport_height - controls_height) * 0.62).max(220.0);
-                draw_reactions(ui, model, input, case, canvas_height, &mut self.view);
+                draw_reactions(
+                    ui,
+                    model,
+                    input,
+                    case,
+                    canvas_height,
+                    &mut self.view,
+                    reaction_display,
+                );
                 ui.separator();
                 egui::Grid::new("fem_reactions")
                     .striped(true)
@@ -951,7 +982,14 @@ fn draw_model(
                     );
                 }
                 if p.mz != 0.0 {
-                    draw_moment_arrow(&painter, rect, tip, p.mz, Color32::from_rgb(235, 160, 105));
+                    draw_moment_arrow(
+                        &painter,
+                        rect,
+                        tip,
+                        p.mz,
+                        Color32::from_rgb(235, 160, 105),
+                        None,
+                    );
                 }
             }
         }
@@ -1007,7 +1045,14 @@ fn draw_model(
                 );
             }
             if data.mz != 0.0 {
-                draw_moment_arrow(&painter, rect, p, data.mz, Color32::from_rgb(235, 160, 105));
+                draw_moment_arrow(
+                    &painter,
+                    rect,
+                    p,
+                    data.mz,
+                    Color32::from_rgb(235, 160, 105),
+                    None,
+                );
             }
         }
         if let Some(click) = click {
@@ -1061,6 +1106,7 @@ fn draw_reactions(
     result: &LoadCaseResult,
     height: f32,
     view_state: &mut FemViewState,
+    display: ReactionDisplay,
 ) {
     let width = ui.available_width();
     let (response, painter) =
@@ -1135,8 +1181,12 @@ fn draw_reactions(
             let angle = data.normal_deg.to_radians();
             let normal = reaction[0] * angle.cos() + reaction[1] * angle.sin();
             if visible(normal) {
-                let direction =
-                    Vec2::new(angle.cos() as f32, -angle.sin() as f32) * normal.signum() as f32;
+                let axis = Vec2::new(angle.cos() as f32, -angle.sin() as f32);
+                let direction = if display == ReactionDisplay::Actual {
+                    axis * normal.signum() as f32
+                } else {
+                    axis
+                };
                 draw_arrow(
                     &painter,
                     p - direction * 52.0,
@@ -1146,7 +1196,11 @@ fn draw_reactions(
                 painter.text(
                     p - direction * 58.0 + Vec2::new(0.0, -10.0),
                     Align2::CENTER_CENTER,
-                    format!("Rₙ={}", format_number(normal)),
+                    if display == ReactionDisplay::Actual {
+                        format!("|Rₙ|={}", format_number(normal.abs()))
+                    } else {
+                        format!("Rₙ={}", format_number(normal))
+                    },
                     FontId::proportional(11.0),
                     reaction_color,
                 );
@@ -1162,7 +1216,11 @@ fn draw_reactions(
                 ),
             ] {
                 if visible(value) {
-                    let direction = axis * value.signum() as f32;
+                    let direction = if display == ReactionDisplay::Actual {
+                        axis * value.signum() as f32
+                    } else {
+                        axis
+                    };
                     draw_arrow(
                         &painter,
                         p - direction * 48.0,
@@ -1172,7 +1230,11 @@ fn draw_reactions(
                     painter.text(
                         p - direction * 55.0 + offset,
                         Align2::CENTER_CENTER,
-                        format!("{label}={}", format_number(value)),
+                        if display == ReactionDisplay::Actual {
+                            format!("|{label}|={}", format_number(value.abs()))
+                        } else {
+                            format!("{label}={}", format_number(value))
+                        },
                         FontId::proportional(11.0),
                         reaction_color,
                     );
@@ -1180,7 +1242,14 @@ fn draw_reactions(
             }
         }
         if visible(reaction[2]) {
-            draw_moment_arrow(&painter, rect, p, reaction[2], reaction_color);
+            draw_moment_arrow(
+                &painter,
+                rect,
+                p,
+                reaction[2],
+                reaction_color,
+                Some(display),
+            );
         }
     }
 }
@@ -1296,8 +1365,14 @@ fn draw_moment_arrow(
     center: Pos2,
     moment: f64,
     color: Color32,
+    display: Option<ReactionDisplay>,
 ) {
-    let curve = moment_arc_points(center, moment);
+    let direction_moment = if display == Some(ReactionDisplay::Global) {
+        1.0
+    } else {
+        moment
+    };
+    let curve = moment_arc_points(center, direction_moment);
     let end = curve[curve.len() - 1];
     let tangent = (end - curve[curve.len() - 2]).normalized();
     let side = Vec2::new(-tangent.y, tangent.x);
@@ -1306,7 +1381,7 @@ fn draw_moment_arrow(
     painter.line_segment([end, end - tangent * 9.0 + side * 4.0], stroke);
     painter.line_segment([end, end - tangent * 9.0 - side * 4.0], stroke);
     let on_right = center.x + 100.0 <= bounds.max.x;
-    let preferred_y = if moment > 0.0 { -27.0 } else { 27.0 };
+    let preferred_y = if direction_moment > 0.0 { -27.0 } else { 27.0 };
     let label_y = if center.y + preferred_y < bounds.min.y + 12.0
         || center.y + preferred_y > bounds.max.y - 12.0
     {
@@ -1321,7 +1396,11 @@ fn draw_moment_arrow(
         } else {
             Align2::RIGHT_CENTER
         },
-        format!("Mᶻ={}", format_number(moment)),
+        if display == Some(ReactionDisplay::Actual) {
+            format!("|Mᶻ|={}", format_number(moment.abs()))
+        } else {
+            format!("Mᶻ={}", format_number(moment))
+        },
         FontId::proportional(11.0),
         color,
     );
@@ -1384,6 +1463,8 @@ fn draw_epure(
         Quantity::Normal => Color32::from_rgb(190, 135, 235),
         Quantity::Shear => Color32::from_rgb(235, 205, 90),
     };
+    let mut line_obstacles = Vec::new();
+    let mut labels = Vec::new();
     for (rod, member) in model.rods.iter().zip(&result.members) {
         let a = model.nodes[rod.start_node].position;
         let b = model.nodes[rod.end_node].position;
@@ -1391,6 +1472,7 @@ fn draw_epure(
         let end = view.point(b.x, b.y);
         let d = end - start;
         let normal = Vec2::new(-d.y, d.x) / d.length().max(1.0);
+        let tangent = d / d.length().max(1.0);
         let mut samples = (0..=64).map(|i| i as f64 / 64.0).collect::<Vec<_>>();
         for point in &member.point_loads_local {
             samples.push((point.xi - 1e-8).max(0.0));
@@ -1405,25 +1487,52 @@ fn draw_epure(
             })
             .collect::<Vec<_>>();
         painter.line_segment([start, end], Stroke::new(2.0, Color32::LIGHT_GRAY));
+        line_obstacles.push([start, end]);
         let stroke = Stroke::new(2.2, color);
         if let (Some(first), Some(last)) = (curve.first(), curve.last()) {
             // Замыкаем крайние ординаты на узлы стержня.
             painter.line_segment([start, *first], stroke);
             painter.line_segment([*last, end], stroke);
+            line_obstacles.push([start, *first]);
+            line_obstacles.push([*last, end]);
         }
+        line_obstacles.extend(curve.windows(2).map(|pair| [pair[0], pair[1]]));
         painter.add(Shape::line(curve, stroke));
         for t in [0.0_f64, 0.5, 1.0] {
             let ordinate = section_value(member.at(t * member.length), quantity);
             let pos = start.lerp(end, t as f32) + normal * ordinate as f32 * scale;
             painter.circle_filled(pos, 2.5, color);
-            painter.text(
-                pos + normal * 8.0,
-                Align2::CENTER_CENTER,
+            labels.push((
+                pos,
+                normal,
+                tangent,
+                ordinate,
+                t as f32,
                 format_number(ordinate),
-                FontId::monospace(10.0),
-                color,
-            );
+            ));
         }
+    }
+    let mut placed = Vec::new();
+    let font = FontId::monospace(10.0);
+    for (anchor, normal, tangent, value, fraction, text) in labels {
+        let size = painter
+            .layout_no_wrap(text.clone(), font.clone(), color)
+            .size();
+        let center = position_epure_label(
+            EpureLabelSpec {
+                anchor,
+                normal,
+                tangent,
+                value,
+                fraction,
+                text_size: size,
+            },
+            rect,
+            &line_obstacles,
+            &placed,
+        );
+        painter.text(center, Align2::CENTER_CENTER, text, font.clone(), color);
+        placed.push(Rect::from_center_size(center, size).expand(3.0));
     }
     for (index, node) in model.nodes.iter().enumerate() {
         if model.is_internal_hinge_node(index) {
@@ -1437,6 +1546,62 @@ fn draw_epure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epure_value_label_stays_clear_of_member_and_neighbor_line() {
+        let bounds = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(220.0, 200.0));
+        let lines = vec![
+            [Pos2::new(100.0, 20.0), Pos2::new(100.0, 180.0)],
+            [Pos2::new(150.0, 20.0), Pos2::new(150.0, 180.0)],
+        ];
+        let size = Vec2::new(36.0, 14.0);
+        let center = position_epure_label(
+            EpureLabelSpec {
+                anchor: Pos2::new(100.0, 100.0),
+                normal: Vec2::X,
+                tangent: Vec2::Y,
+                value: 1.0,
+                fraction: 0.5,
+                text_size: size,
+            },
+            bounds,
+            &lines,
+            &[],
+        );
+        let label = Rect::from_center_size(center, size).expand(2.0);
+        assert!(bounds.contains_rect(label));
+        assert!(lines
+            .iter()
+            .all(|line| !crate::canvas::segment_intersects_rect(*line, label)));
+    }
+
+    #[test]
+    fn epure_value_label_moves_to_other_side_when_first_side_is_blocked() {
+        let bounds = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(220.0, 200.0));
+        let lines = vec![
+            [Pos2::new(100.0, 20.0), Pos2::new(100.0, 180.0)],
+            [Pos2::new(128.0, 20.0), Pos2::new(128.0, 180.0)],
+        ];
+        let size = Vec2::new(36.0, 14.0);
+        let center = position_epure_label(
+            EpureLabelSpec {
+                anchor: Pos2::new(100.0, 100.0),
+                normal: Vec2::X,
+                tangent: Vec2::Y,
+                value: 1.0,
+                fraction: 0.5,
+                text_size: size,
+            },
+            bounds,
+            &lines,
+            &[],
+        );
+        let label = Rect::from_center_size(center, size).expand(2.0);
+        assert!(center.x < 100.0);
+        assert!(lines
+            .iter()
+            .all(|line| !crate::canvas::segment_intersects_rect(*line, label)));
+    }
 
     #[test]
     fn moment_arrows_follow_the_sign_convention() {

@@ -8,8 +8,9 @@ use std::io::Cursor;
 
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use mohr_frame::{
-    calculate_displacement_components, calculate_kinematic_displacement_components,
-    calculate_thermal_displacement_components,
+    calculate_displacement_components_with_rounding,
+    calculate_kinematic_displacement_components_with_rounding,
+    calculate_thermal_displacement_components_with_rounding,
     fem::{
         FemProject, FemResult, LoadCaseResult, SectionForces, StiffnessMode, SupportKind,
         UnitComponent,
@@ -80,6 +81,10 @@ pub fn build_fem_word_report(
     ));
     body.push_str(&paragraph(
         &format!("Целевая точка: {}. Плоский элемент Эйлера — Бернулли; три степени свободы в узле (uₓ, uᵧ, φ).", input.target_node_id),
+        None, false,
+    ));
+    body.push_str(&paragraph(
+        "Реакции в таблицах приведены как знаковые проекции на глобальные оси X, Y и Mz. Настройка стрелок меняет только схематическое представление.",
         None, false,
     ));
 
@@ -688,20 +693,36 @@ fn render_fem_scheme_png(model: &StructuralModel, input: &FemProject) -> Result<
 }
 
 /// Создаёт готовый DOCX-отчёт в памяти.
+#[cfg(test)]
 pub fn build_word_report(
     model: &StructuralModel,
     rigidity: Rigidity,
     expansion: ThermalExpansion,
     effects: EffectsSelection,
 ) -> Result<Vec<u8>, String> {
+    build_word_report_with_rounding(model, rigidity, expansion, effects, None)
+}
+
+pub fn build_word_report_with_rounding(
+    model: &StructuralModel,
+    rigidity: Rigidity,
+    expansion: ThermalExpansion,
+    effects: EffectsSelection,
+    decimals: Option<u8>,
+) -> Result<Vec<u8>, String> {
     model.validate()?;
-    let results = calculate_displacement_components(model, rigidity)?;
-    let thermal = calculate_thermal_displacement_components(model, expansion)?;
-    let kinematic = calculate_kinematic_displacement_components(model)?;
+    let results = calculate_displacement_components_with_rounding(model, rigidity, decimals)?;
+    let thermal =
+        calculate_thermal_displacement_components_with_rounding(model, expansion, decimals)?;
+    let kinematic = calculate_kinematic_displacement_components_with_rounding(model, decimals)?;
     let scheme_png = render_scheme_png(model)?;
-    let document_xml = build_document_xml(
+    let mut document_xml = build_document_xml(
         model, rigidity, expansion, effects, &results, &thermal, &kinematic,
     )?;
+    if let Some(decimals) = decimals {
+        let note = paragraph(&format!("Учебный режим: расчётные ординаты и вклады округлены до {decimals} знаков после запятой. Исходные свойства и коэффициенты сохранены с полной точностью."), None, false);
+        document_xml = document_xml.replacen("<w:body>", &format!("<w:body>{note}"), 1);
+    }
 
     let mut archive = StoredZip::default();
     archive.add("[Content_Types].xml", content_types_xml().as_bytes());
@@ -2235,6 +2256,27 @@ mod tests {
         assert!(bytes
             .windows("kα".len())
             .any(|part| part == "kα".as_bytes()));
+    }
+
+    #[test]
+    fn word_report_marks_classroom_rounding_mode() {
+        let mut model = model();
+        model.rods[0].unit_x_diagram = model.rods[0].load_diagram.clone();
+        let bytes = build_word_report_with_rounding(
+            &model,
+            Rigidity::Symbolic,
+            ThermalExpansion::Symbolic,
+            EffectsSelection {
+                force: true,
+                thermal: false,
+                kinematic: false,
+            },
+            Some(2),
+        )
+        .unwrap();
+        assert!(bytes
+            .windows("Учебный режим".len())
+            .any(|part| part == "Учебный режим".as_bytes()));
     }
 
     #[test]

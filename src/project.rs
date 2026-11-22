@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canvas::CanvasViewState;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 const PROJECT_FORMAT_ID: &str = "mohr-frame-project";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,6 +29,14 @@ pub struct ProjectData {
     pub show_values: bool,
     #[serde(default)]
     pub view_state: CanvasViewState,
+    #[serde(default)]
+    pub calculation_rounding: bool,
+    #[serde(default = "default_calculation_decimals")]
+    pub calculation_decimals: u8,
+}
+
+fn default_calculation_decimals() -> u8 {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +106,7 @@ fn save_project_with_paths(paths: &ProjectPaths, data: &ProjectData) -> Result<P
         format: PROJECT_FORMAT_ID.into(),
         schema_version: CURRENT_SCHEMA_VERSION,
         created_with: env!("CARGO_PKG_VERSION").into(),
-        minimum_reader: "0.8.1".into(),
+        minimum_reader: "0.8.2".into(),
         data: data.clone(),
     };
     let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::default())
@@ -299,6 +307,8 @@ pub(crate) fn deserialize_project_text(text: &str) -> Result<(ProjectData, bool)
             effects: EffectsSelection::default(),
             show_values: legacy.show_values,
             view_state: CanvasViewState::default(),
+            calculation_rounding: false,
+            calculation_decimals: 2,
         };
         data.model
             .ensure_property_presets(data.rigidity, data.thermal_expansion);
@@ -540,6 +550,8 @@ mod tests {
             effects: EffectsSelection::default(),
             show_values: true,
             view_state: CanvasViewState::default(),
+            calculation_rounding: false,
+            calculation_decimals: 2,
         }
     }
 
@@ -585,6 +597,8 @@ mod tests {
     #[test]
     fn current_format_roundtrip_preserves_view_state() {
         let mut data = sample_data();
+        data.calculation_rounding = true;
+        data.calculation_decimals = 3;
         data.model
             .rigidity_presets
             .push(mohr_frame::PropertyPreset {
@@ -635,6 +649,27 @@ mod tests {
         let (restored, migrated) = deserialize_project_text(&text).unwrap();
         assert!(!migrated);
         assert_eq!(restored, data);
+    }
+
+    #[test]
+    fn v081_file_without_rounding_settings_uses_full_precision() {
+        let file = ProjectFileV2 {
+            format: PROJECT_FORMAT_ID.into(),
+            schema_version: 7,
+            created_with: "0.8.1".into(),
+            minimum_reader: "0.8.1".into(),
+            data: sample_data(),
+        };
+        let text = ron::ser::to_string(&file)
+            .unwrap()
+            .replace("calculation_rounding:false,", "")
+            .replace("calculation_decimals:2", "");
+        assert!(!text.contains("calculation_rounding"));
+        assert!(!text.contains("calculation_decimals"));
+        let (loaded, migrated) = deserialize_project_text(&text).unwrap();
+        assert!(migrated);
+        assert!(!loaded.calculation_rounding);
+        assert_eq!(loaded.calculation_decimals, 2);
     }
 
     #[test]

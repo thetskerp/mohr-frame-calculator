@@ -10,18 +10,20 @@ mod table_editor;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use canvas::{frame_canvas, CanvasOptions, CanvasViewState, DiagramChoice, GOST_FONT_FAMILY};
-use docx_report::{build_fem_word_report, build_word_report};
+use docx_report::{build_fem_word_report, build_word_report_with_rounding};
 use eframe::egui::{
     self, Align2, Color32, ComboBox, DragValue, FontData, FontDefinitions, FontFamily, RichText,
     Vec2,
 };
-use fem_window::FemWindow;
+use fem_window::{FemWindow, ReactionDisplay};
 use mohr_frame::{
-    calculate_displacement_components, calculate_kinematic_displacement_components,
-    calculate_thermal_displacement_components, fem::FemProject, format_number, next_node_id,
-    CalculationResult, Diagram, DiagramKind, EffectsSelection, FiberSide, Frame, KinematicResult,
-    Node, Ordinate, Point, PropertyPreset, Rigidity, Rod, SegmentOrientation, StructuralModel,
-    SupportDirection, SupportMotion, TemperatureLoad, ThermalCalculationResult, ThermalExpansion,
+    calculate_displacement_components_with_rounding,
+    calculate_kinematic_displacement_components_with_rounding,
+    calculate_thermal_displacement_components_with_rounding, fem::FemProject, format_number,
+    next_node_id, set_display_decimals, CalculationResult, Diagram, DiagramKind, EffectsSelection,
+    FiberSide, Frame, KinematicResult, Node, Ordinate, Point, PropertyPreset, Rigidity, Rod,
+    SegmentOrientation, StructuralModel, SupportDirection, SupportMotion, TemperatureLoad,
+    ThermalCalculationResult, ThermalExpansion,
 };
 use project::{
     export_for_v050, export_for_v050_for_path, load_project_from_path, project_name_from_path,
@@ -36,6 +38,10 @@ use table_editor::TableEditor;
 
 const APP_KEY: &str = "mohr-frame-gui";
 const STORAGE_KEY: &str = "frame_app_state";
+
+fn default_display_decimals() -> u8 {
+    2
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 enum WorkspaceTab {
@@ -77,6 +83,18 @@ struct MohrApp {
     thermal_expansion: ThermalExpansion,
     #[serde(default)]
     effects: EffectsSelection,
+    /// Настройки отображения применяются ко всем проектам на этом компьютере.
+    #[serde(default = "default_display_decimals")]
+    display_decimals: u8,
+    #[serde(default)]
+    reaction_display: ReactionDisplay,
+    /// Режим вычислений сохраняется вместе со схемой.
+    #[serde(default)]
+    calculation_rounding: bool,
+    #[serde(default = "default_display_decimals")]
+    calculation_decimals: u8,
+    #[serde(skip)]
+    settings_open: bool,
     #[serde(default)]
     selected_node: usize,
     #[serde(default, alias = "selected_segment")]
@@ -120,6 +138,11 @@ impl Default for MohrApp {
             rigidity: Rigidity::Symbolic,
             thermal_expansion: ThermalExpansion::Symbolic,
             effects: EffectsSelection::default(),
+            display_decimals: 2,
+            reaction_display: ReactionDisplay::default(),
+            calculation_rounding: false,
+            calculation_decimals: 2,
+            settings_open: false,
             selected_node: 0,
             selected_rod: 0,
             show_values: true,
@@ -139,6 +162,46 @@ impl Default for MohrApp {
 }
 
 impl MohrApp {
+    fn rounding_decimals(&self) -> Option<u8> {
+        self.calculation_rounding
+            .then_some(self.calculation_decimals.min(10))
+    }
+
+    fn show_app_settings(&mut self, context: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = self.settings_open;
+        egui::Window::new("Настройки приложения")
+            .open(&mut open)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Знаков после запятой:");
+                    ui.add(DragValue::new(&mut self.display_decimals).range(0..=10));
+                });
+                ComboBox::from_label("Направление реакций")
+                    .selected_text(self.reaction_display.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.reaction_display, ReactionDisplay::Global, ReactionDisplay::Global.label());
+                        ui.selectable_value(&mut self.reaction_display, ReactionDisplay::Actual, ReactionDisplay::Actual.label());
+                    });
+                ui.small("В таблицах реакции всегда остаются алгебраическими проекциями на глобальные оси.");
+                ui.separator();
+                ui.strong("Текущий проект");
+                ui.checkbox(&mut self.calculation_rounding, "Использовать округлённые значения в расчёте");
+                if self.calculation_rounding {
+                    ui.horizontal(|ui| {
+                        ui.label("Знаков на расчётных шагах:");
+                        ui.add(DragValue::new(&mut self.calculation_decimals).range(0..=10));
+                    });
+                    ui.small("МКЭ решается с полной точностью; округляются усилия и реакции при передаче, затем показанные шаги расчёта перемещений.");
+                }
+            });
+        self.settings_open = open;
+        set_display_decimals(self.display_decimals);
+    }
+
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_style(&cc.egui_ctx);
         let mut app: Self = cc
@@ -160,6 +223,9 @@ impl MohrApp {
             app.project_name = default_project_name();
         }
         app.clamp_selection();
+        app.display_decimals = app.display_decimals.min(10);
+        app.calculation_decimals = app.calculation_decimals.min(10);
+        set_display_decimals(app.display_decimals);
         app
     }
 
@@ -185,6 +251,8 @@ impl MohrApp {
             effects: self.effects,
             show_values: self.show_values,
             view_state: self.canvas_view.clone(),
+            calculation_rounding: self.calculation_rounding,
+            calculation_decimals: self.calculation_decimals,
         }
     }
 
@@ -244,6 +312,8 @@ impl MohrApp {
                 self.effects = loaded.data.effects;
                 self.show_values = loaded.data.show_values;
                 self.canvas_view = loaded.data.view_state;
+                self.calculation_rounding = loaded.data.calculation_rounding;
+                self.calculation_decimals = loaded.data.calculation_decimals.min(10);
                 self.clamp_selection();
                 self.project_message = if let Some(warning) = &geometry_warning {
                     format!(
@@ -270,11 +340,12 @@ impl MohrApp {
     fn export_word_report(&mut self) {
         let result = (|| {
             self.model.validate()?;
-            let bytes = build_word_report(
+            let bytes = build_word_report_with_rounding(
                 &self.model,
                 self.rigidity,
                 self.thermal_expansion,
                 self.effects,
+                self.rounding_decimals(),
             )?;
             match self.project_path.as_deref() {
                 Some(path) => save_word_report_for_path(path, &bytes),
@@ -323,6 +394,8 @@ impl MohrApp {
         self.rigidity = Rigidity::Symbolic;
         self.thermal_expansion = ThermalExpansion::Symbolic;
         self.effects = EffectsSelection::default();
+        self.calculation_rounding = false;
+        self.calculation_decimals = 2;
         self.selected_node = 0;
         self.selected_rod = 0;
         self.show_values = true;
@@ -346,6 +419,9 @@ impl MohrApp {
                         ui.separator();
                         if ui.button("Очистить схему…").clicked() { self.confirm_clear = true; ui.close(); }
                     });
+                    if ui.button("Настройки приложения").clicked() {
+                        self.settings_open = true;
+                    }
                     if ui.button("Настройка коэффициентов").clicked() {
                         self.property_editor.open_with(&self.model);
                     }
@@ -708,7 +784,7 @@ impl MohrApp {
 
     fn show_force_panel(&mut self, root_ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(root_ui, |ui| {
-            result_header(ui, &self.model, self.rigidity);
+            result_header(ui, &self.model, self.rigidity, self.rounding_decimals());
             ui.add_space(6.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let row_height = 230.0;
@@ -852,7 +928,12 @@ impl MohrApp {
 
     fn show_thermal_panel(&mut self, root_ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(root_ui, |ui| {
-            thermal_result_header(ui, &self.model, self.thermal_expansion);
+            thermal_result_header(
+                ui,
+                &self.model,
+                self.thermal_expansion,
+                self.rounding_decimals(),
+            );
             ui.add_space(6.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let row_height = 230.0;
@@ -1056,7 +1137,10 @@ impl MohrApp {
                 &mut self.canvas_view,
             );
             ui.separator();
-            match calculate_kinematic_displacement_components(&self.model) {
+            match calculate_kinematic_displacement_components_with_rounding(
+                &self.model,
+                self.rounding_decimals(),
+            ) {
                 Ok(result) => {
                     ui.heading("Кинематические перемещения");
                     ui.small("Для каждой опорной связи: −Rᵢ·cᵢ. Нулевые слагаемые показаны.");
@@ -1092,6 +1176,7 @@ fn show_kinematic_result(ui: &mut egui::Ui, symbol: &str, result: &KinematicResu
 
 impl eframe::App for MohrApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        set_display_decimals(self.display_decimals);
         self.clamp_selection();
         self.show_top_toolbar(ui);
         match self.active_tab {
@@ -1110,6 +1195,7 @@ impl eframe::App for MohrApp {
             WorkspaceTab::KinematicDisplacement => self.show_kinematic_panel(ui),
         }
         self.show_clear_confirmation(ui.ctx());
+        self.show_app_settings(ui.ctx());
         if let Some(model) = self.table_editor.show(ui.ctx()) {
             self.model = model;
             self.clamp_selection();
@@ -1122,10 +1208,14 @@ impl eframe::App for MohrApp {
             self.project_message = "Свойства стержней обновлены из таблицы".into();
             self.project_message_is_error = false;
         }
-        if let Some(model) = self
-            .fem_window
-            .show(ui.ctx(), &mut self.model, &mut self.fem)
-        {
+        let rounding = self.rounding_decimals();
+        if let Some(model) = self.fem_window.show(
+            ui.ctx(),
+            &mut self.model,
+            &mut self.fem,
+            rounding,
+            self.reaction_display,
+        ) {
             self.model = model;
             self.project_message =
                 "Эпюры и единичные реакции МКЭ переданы в основной расчёт".into();
@@ -1181,11 +1271,17 @@ fn configure_style(ctx: &egui::Context) {
     ctx.set_visuals(egui::Visuals::dark());
 }
 
-fn result_header(ui: &mut egui::Ui, model: &StructuralModel, rigidity: Rigidity) {
+fn result_header(
+    ui: &mut egui::Ui,
+    model: &StructuralModel,
+    rigidity: Rigidity,
+    decimals: Option<u8>,
+) {
     egui::Frame::group(ui.style())
         .fill(Color32::from_rgb(28, 35, 46))
-        .show(ui, |ui| {
-            match calculate_displacement_components(model, rigidity) {
+        .show(
+            ui,
+            |ui| match calculate_displacement_components_with_rounding(model, rigidity, decimals) {
                 Ok(result) => {
                     let target = &model.nodes[model.target_node].id;
                     ui.horizontal_wrapped(|ui| {
@@ -1283,8 +1379,8 @@ fn result_header(ui: &mut egui::Ui, model: &StructuralModel, rigidity: Rigidity)
                 Err(error) => {
                     ui.colored_label(Color32::LIGHT_RED, format!("Расчёт: {error}"));
                 }
-            }
-        });
+            },
+        );
 }
 
 fn force_item_text(item: &mohr_frame::SegmentContribution) -> String {
@@ -1301,11 +1397,16 @@ fn thermal_item_text(item: &mohr_frame::ThermalRodContribution) -> String {
     }
 }
 
-fn thermal_result_header(ui: &mut egui::Ui, model: &StructuralModel, expansion: ThermalExpansion) {
+fn thermal_result_header(
+    ui: &mut egui::Ui,
+    model: &StructuralModel,
+    expansion: ThermalExpansion,
+    decimals: Option<u8>,
+) {
     egui::Frame::group(ui.style())
         .fill(Color32::from_rgb(42, 31, 31))
         .show(ui, |ui| {
-            match calculate_thermal_displacement_components(model, expansion) {
+            match calculate_thermal_displacement_components_with_rounding(model, expansion, decimals) {
                 Ok(result) => {
                     let target = &model.nodes[model.target_node].id;
                     ui.horizontal_wrapped(|ui| {

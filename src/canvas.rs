@@ -423,6 +423,106 @@ fn draw_supports(painter: &egui::Painter, model: &StructuralModel, transform: &C
     }
 }
 
+/// Проверка пересечения линии с прямоугольником подписи (отсечение Лианга — Барски).
+pub(crate) fn segment_intersects_rect([a, b]: [Pos2; 2], rect: Rect) -> bool {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let mut lower = 0.0_f32;
+    let mut upper = 1.0_f32;
+    for (p, q) in [
+        (-dx, a.x - rect.min.x),
+        (dx, rect.max.x - a.x),
+        (-dy, a.y - rect.min.y),
+        (dy, rect.max.y - a.y),
+    ] {
+        if p.abs() < 1e-6 {
+            if q < 0.0 {
+                return false;
+            }
+        } else {
+            let fraction = q / p;
+            if p < 0.0 {
+                lower = lower.max(fraction);
+            } else {
+                upper = upper.min(fraction);
+            }
+            if lower > upper {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Подбирает положение числовой ординаты с учётом её размера, стержней,
+/// линий эпюр и уже размещённых подписей. Координаты в пикселях холста.
+pub(crate) struct EpureLabelSpec {
+    pub anchor: Pos2,
+    pub normal: Vec2,
+    pub tangent: Vec2,
+    pub value: f64,
+    pub fraction: f32,
+    pub text_size: Vec2,
+}
+
+pub(crate) fn position_epure_label(
+    spec: EpureLabelSpec,
+    bounds: Rect,
+    lines: &[[Pos2; 2]],
+    placed: &[Rect],
+) -> Pos2 {
+    let EpureLabelSpec {
+        anchor,
+        normal,
+        tangent,
+        value,
+        fraction,
+        text_size,
+    } = spec;
+    let normal = normal.normalized();
+    let tangent = tangent.normalized();
+    let outward = if value < 0.0 { -normal } else { normal };
+    let normal_step = (outward.x.abs() * text_size.x + outward.y.abs() * text_size.y) / 2.0 + 9.0;
+    let tangent_step = (tangent.x.abs() * text_size.x + tangent.y.abs() * text_size.y) / 2.0 + 10.0;
+    let endpoint_sign = if fraction <= 0.01 { -1.0 } else { 1.0 };
+    let shifts = [
+        0.0,
+        endpoint_sign * tangent_step,
+        -endpoint_sign * tangent_step,
+        endpoint_sign * 2.0 * tangent_step,
+        -endpoint_sign * 2.0 * tangent_step,
+    ];
+    let mut best = anchor + outward * normal_step;
+    let mut best_cost = f32::INFINITY;
+    for multiplier in [1.0_f32, -1.0, 2.0, -2.0, 3.0, -3.0] {
+        for shift in shifts {
+            let center = anchor + outward * normal_step * multiplier + tangent * shift;
+            let area = Rect::from_center_size(center, text_size).expand(3.0);
+            let line_hits = lines
+                .iter()
+                .filter(|line| segment_intersects_rect(**line, area))
+                .count();
+            let label_hits = placed.iter().filter(|other| other.intersects(area)).count();
+            let mut cost = line_hits as f32 * 10_000.0
+                + label_hits as f32 * 20_000.0
+                + if bounds.contains_rect(area) {
+                    0.0
+                } else {
+                    100_000.0
+                };
+            cost += (center - anchor).length();
+            if multiplier < 0.0 {
+                cost += 8.0;
+            }
+            if cost < best_cost {
+                best_cost = cost;
+                best = center;
+            }
+        }
+    }
+    best
+}
+
 fn draw_diagrams(
     painter: &egui::Painter,
     model: &StructuralModel,
@@ -453,6 +553,8 @@ fn draw_diagrams(
         .fold(0.0_f64, f64::max)
         .max(1.0e-12);
     let diagram_scale = transform.rect.height() * 0.22 / max_abs as f32 * ordinate_scale;
+    let mut line_obstacles = Vec::new();
+    let mut labels = Vec::new();
 
     for rod in &model.rods {
         let Some((start_point, end_point, length)) = rod_geometry(model, rod) else {
@@ -464,6 +566,7 @@ fn draw_diagrams(
         let direction = end - start;
         let unit = direction / direction.length().max(1.0e-6);
         let normal = Vec2::new(-unit.y, unit.x);
+        line_obstacles.push([start, end]);
         let mut curve = Vec::with_capacity(33);
         let mut previous: Option<(Pos2, Pos2)> = None;
         for index in 0..=32 {
@@ -481,6 +584,7 @@ fn draw_diagrams(
             curve.push(point);
             previous = Some((baseline, point));
         }
+        line_obstacles.extend(curve.windows(2).map(|pair| [pair[0], pair[1]]));
         painter.add(Shape::line(curve, Stroke::new(2.2, color)));
         for t in [0.0_f32, 0.5, 1.0] {
             let baseline = start.lerp(end, t);
@@ -490,21 +594,34 @@ fn draw_diagrams(
                 [baseline, point],
                 Stroke::new(1.0, color.gamma_multiply(0.75)),
             );
+            line_obstacles.push([baseline, point]);
             painter.circle_filled(point, 2.8, color);
             if show_values {
-                painter.text(
-                    point + normal * value.signum() as f32 * 5.0,
-                    if value >= 0.0 {
-                        Align2::CENTER_TOP
-                    } else {
-                        Align2::CENTER_BOTTOM
-                    },
-                    format_number(value),
-                    FontId::monospace(11.0),
-                    color,
-                );
+                labels.push((point, normal, unit, value, t, format_number(value)));
             }
         }
+    }
+    let mut placed = Vec::new();
+    let font = FontId::monospace(11.0);
+    for (anchor, normal, tangent, value, fraction, text) in labels {
+        let size = painter
+            .layout_no_wrap(text.clone(), font.clone(), color)
+            .size();
+        let center = position_epure_label(
+            EpureLabelSpec {
+                anchor,
+                normal,
+                tangent,
+                value,
+                fraction,
+                text_size: size,
+            },
+            transform.rect,
+            &line_obstacles,
+            &placed,
+        );
+        painter.text(center, Align2::CENTER_CENTER, text, font.clone(), color);
+        placed.push(Rect::from_center_size(center, size).expand(3.0));
     }
 }
 
@@ -631,6 +748,30 @@ impl CanvasTransform {
 mod tests {
     use super::*;
     use mohr_frame::Node;
+
+    #[test]
+    fn zero_ordinate_label_avoids_baseline_and_previous_label() {
+        let bounds = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(200.0, 200.0));
+        let baseline = [Pos2::new(20.0, 100.0), Pos2::new(180.0, 100.0)];
+        let previous = Rect::from_center_size(Pos2::new(100.0, 82.0), Vec2::new(40.0, 16.0));
+        let size = Vec2::new(40.0, 16.0);
+        let center = position_epure_label(
+            EpureLabelSpec {
+                anchor: Pos2::new(100.0, 100.0),
+                normal: Vec2::new(0.0, -1.0),
+                tangent: Vec2::X,
+                value: 0.0,
+                fraction: 0.5,
+                text_size: size,
+            },
+            bounds,
+            &[baseline],
+            &[previous],
+        );
+        let label = Rect::from_center_size(center, size).expand(3.0);
+        assert!(!segment_intersects_rect(baseline, label));
+        assert!(!previous.intersects(label));
+    }
 
     fn model() -> StructuralModel {
         StructuralModel {

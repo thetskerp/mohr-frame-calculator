@@ -663,24 +663,34 @@ pub struct KinematicDisplacementComponents {
 pub fn calculate_kinematic_displacement_components(
     model: &StructuralModel,
 ) -> Result<KinematicDisplacementComponents, String> {
+    calculate_kinematic_displacement_components_with_rounding(model, None)
+}
+
+/// Учебный режим использует округлённые копии реакций и смещений опор.
+pub fn calculate_kinematic_displacement_components_with_rounding(
+    model: &StructuralModel,
+    decimals: Option<u8>,
+) -> Result<KinematicDisplacementComponents, String> {
     model.validate()?;
     let calculate = |select: fn(&SupportMotion) -> f64| {
         let contributions = model
             .supports
             .iter()
             .map(|support| {
-                let reaction = select(support);
+                let reaction = round_for_calculation(select(support), decimals);
+                let displacement = round_for_calculation(support.displacement, decimals);
                 KinematicContribution {
                     node_id: model.nodes[support.node].id.clone(),
                     direction: support.direction,
                     normal_deg: support.normal_deg,
-                    displacement: support.displacement,
+                    displacement,
                     unit_reaction: reaction,
-                    value: -reaction * support.displacement,
+                    value: round_for_calculation(-reaction * displacement, decimals),
                 }
             })
             .collect::<Vec<_>>();
-        let total = contributions.iter().map(|item| item.value).sum();
+        let total =
+            round_for_calculation(contributions.iter().map(|item| item.value).sum(), decimals);
         KinematicResult {
             contributions,
             total,
@@ -1467,6 +1477,15 @@ pub fn calculate_displacement(
     frame: &Frame,
     rigidity: Rigidity,
 ) -> Result<CalculationResult, String> {
+    calculate_displacement_with_rounding(frame, rigidity, None)
+}
+
+/// Расчёт по округлённым ординатам с округлением вклада каждого стержня.
+pub fn calculate_displacement_with_rounding(
+    frame: &Frame,
+    rigidity: Rigidity,
+    decimals: Option<u8>,
+) -> Result<CalculationResult, String> {
     frame.validate()?;
     if let Rigidity::Numeric(value) = rigidity {
         Rigidity::numeric(value)?;
@@ -1474,30 +1493,31 @@ pub fn calculate_displacement(
 
     let mut contributions = Vec::with_capacity(frame.segments.len());
     for segment in &frame.segments {
-        let mp_left = segment.load_diagram.left_value();
-        let mp_mid = segment.load_diagram.midpoint_value(segment.length);
-        let mp_right = segment.load_diagram.right_value();
-        let m1_left = segment.unit_diagram.left_value();
-        let m1_mid = segment.unit_diagram.midpoint_value(segment.length);
-        let m1_right = segment.unit_diagram.right_value();
+        let length = round_for_calculation(segment.length, decimals);
+        let mp_left = round_for_calculation(segment.load_diagram.left_value(), decimals);
+        let mp_mid = round_for_calculation(segment.load_diagram.midpoint_value(length), decimals);
+        let mp_right = round_for_calculation(segment.load_diagram.right_value(), decimals);
+        let m1_left = round_for_calculation(segment.unit_diagram.left_value(), decimals);
+        let m1_mid = round_for_calculation(segment.unit_diagram.midpoint_value(length), decimals);
+        let m1_right = round_for_calculation(segment.unit_diagram.right_value(), decimals);
 
         let has_parabola = segment.load_diagram.kind == DiagramKind::Parabolic
             || segment.unit_diagram.kind == DiagramKind::Parabolic;
         let (raw_integral, method) = if has_parabola {
             (
-                segment.length / 6.0
-                    * (mp_left * m1_left + 4.0 * mp_mid * m1_mid + mp_right * m1_right),
+                length / 6.0 * (mp_left * m1_left + 4.0 * mp_mid * m1_mid + mp_right * m1_right),
                 IntegrationMethod::SimpsonThreePoint,
             )
         } else {
             (
-                segment.length / 6.0
+                length / 6.0
                     * (mp_left * (2.0 * m1_left + m1_right)
                         + mp_right * (m1_left + 2.0 * m1_right)),
                 IntegrationMethod::TrapezoidalProduct,
             )
         };
-        let integral = raw_integral / segment.rigidity_factor;
+        let raw_integral = round_for_calculation(raw_integral, decimals);
+        let integral = round_for_calculation(raw_integral / segment.rigidity_factor, decimals);
 
         contributions.push(SegmentContribution {
             segment_id: segment.id.clone(),
@@ -1511,7 +1531,10 @@ pub fn calculate_displacement(
         });
     }
 
-    let numerator = contributions.iter().map(|item| item.integral).sum();
+    let numerator = round_for_calculation(
+        contributions.iter().map(|item| item.integral).sum(),
+        decimals,
+    );
     Ok(CalculationResult {
         contributions,
         numerator,
@@ -1525,11 +1548,19 @@ pub fn calculate_displacement_components(
     model: &StructuralModel,
     rigidity: Rigidity,
 ) -> Result<DisplacementComponents, String> {
+    calculate_displacement_components_with_rounding(model, rigidity, None)
+}
+
+pub fn calculate_displacement_components_with_rounding(
+    model: &StructuralModel,
+    rigidity: Rigidity,
+    decimals: Option<u8>,
+) -> Result<DisplacementComponents, String> {
     let horizontal_frame = model.frame_for(DisplacementDirection::Horizontal)?;
     let vertical_frame = model.frame_for(DisplacementDirection::Vertical)?;
     let rotation_frame = model.frame_for(DisplacementDirection::Rotation)?;
     let calculate = |frame: &Frame| -> Result<CalculationResult, String> {
-        let mut result = calculate_displacement(frame, rigidity)?;
+        let mut result = calculate_displacement_with_rounding(frame, rigidity, decimals)?;
         if model
             .rods
             .iter()
@@ -1547,8 +1578,12 @@ pub fn calculate_displacement_components(
                             .ok_or("некорректная числовая жёсткость")?;
                     result.numeric_part += item.integral;
                 } else {
-                    item.integral = item.raw_integral / property.symbolic_factor;
-                    result.numerator += item.integral;
+                    item.integral = round_for_calculation(
+                        item.raw_integral / property.symbolic_factor,
+                        decimals,
+                    );
+                    result.numerator =
+                        round_for_calculation(result.numerator + item.integral, decimals);
                 }
             }
         }
@@ -1569,6 +1604,14 @@ pub fn calculate_thermal_displacement_components(
     model: &StructuralModel,
     expansion: ThermalExpansion,
 ) -> Result<ThermalDisplacementComponents, String> {
+    calculate_thermal_displacement_components_with_rounding(model, expansion, None)
+}
+
+pub fn calculate_thermal_displacement_components_with_rounding(
+    model: &StructuralModel,
+    expansion: ThermalExpansion,
+    decimals: Option<u8>,
+) -> Result<ThermalDisplacementComponents, String> {
     model.validate()?;
     if let ThermalExpansion::Numeric(value) = expansion {
         ThermalExpansion::numeric(value)?;
@@ -1578,9 +1621,20 @@ pub fn calculate_thermal_displacement_components(
             model,
             expansion,
             DisplacementDirection::Horizontal,
+            decimals,
         )?,
-        vertical: calculate_thermal_direction(model, expansion, DisplacementDirection::Vertical)?,
-        rotation: calculate_thermal_direction(model, expansion, DisplacementDirection::Rotation)?,
+        vertical: calculate_thermal_direction(
+            model,
+            expansion,
+            DisplacementDirection::Vertical,
+            decimals,
+        )?,
+        rotation: calculate_thermal_direction(
+            model,
+            expansion,
+            DisplacementDirection::Rotation,
+            decimals,
+        )?,
     })
 }
 
@@ -1588,13 +1642,14 @@ fn calculate_thermal_direction(
     model: &StructuralModel,
     expansion: ThermalExpansion,
     direction: DisplacementDirection,
+    decimals: Option<u8>,
 ) -> Result<ThermalCalculationResult, String> {
     let mut contributions = Vec::with_capacity(model.rods.len());
     let has_presets = model.rods.iter().any(|rod| rod.thermal_preset_id.is_some());
     let mut symbolic_coefficient = 0.0;
     let mut numeric_part = 0.0;
     for rod in &model.rods {
-        let length = model.rod_length(rod)?;
+        let length = round_for_calculation(model.rod_length(rod)?, decimals);
         let moment = match direction {
             DisplacementDirection::Horizontal => &rod.unit_x_diagram,
             DisplacementDirection::Vertical => &rod.unit_y_diagram,
@@ -1606,20 +1661,31 @@ fn calculate_thermal_direction(
             DisplacementDirection::Rotation => &rod.unit_normal_rotation_diagram,
         };
         let active = rod.temperature.is_some();
-        let temperature = rod.temperature.unwrap_or_default();
-        let difference = temperature.difference();
+        let original_temperature = rod.temperature.unwrap_or_default();
+        let temperature = TemperatureLoad {
+            upper_or_left: round_for_calculation(original_temperature.upper_or_left, decimals),
+            lower_or_right: round_for_calculation(original_temperature.lower_or_right, decimals),
+        };
+        let difference = round_for_calculation(temperature.difference(), decimals);
         let hotter_side = temperature.hotter_side();
         let hotter_side_sign = temperature.hotter_side_sign();
-        let mean = temperature.mean();
-        let moment_area = moment.signed_area(length);
-        let normal_area = normal.signed_area(length);
+        let mean = round_for_calculation(temperature.mean(), decimals);
+        let moment_area = round_for_calculation(moment.signed_area(length), decimals);
+        let normal_area = round_for_calculation(normal.signed_area(length), decimals);
         let bending_term = if active {
-            hotter_side_sign * difference / rod.section_height * moment_area
+            round_for_calculation(
+                hotter_side_sign * difference / rod.section_height * moment_area,
+                decimals,
+            )
         } else {
             0.0
         };
-        let axial_term = if active { mean * normal_area } else { 0.0 };
-        let base_term = bending_term + axial_term;
+        let axial_term = if active {
+            round_for_calculation(mean * normal_area, decimals)
+        } else {
+            0.0
+        };
+        let base_term = round_for_calculation(bending_term + axial_term, decimals);
         let property = if has_presets {
             Some(model.thermal_value(rod, expansion)?)
         } else {
@@ -1634,12 +1700,12 @@ fn calculate_thermal_direction(
                 numeric_part += value;
                 value
             } else {
-                let value = base_term * property.symbolic_factor;
+                let value = round_for_calculation(base_term * property.symbolic_factor, decimals);
                 symbolic_coefficient += value;
                 value
             }
         } else {
-            rod.thermal_expansion_factor * base_term
+            round_for_calculation(rod.thermal_expansion_factor * base_term, decimals)
         };
         contributions.push(ThermalRodContribution {
             rod_id: rod.id.clone(),
@@ -1662,9 +1728,12 @@ fn calculate_thermal_direction(
         });
     }
     let coefficient = if has_presets {
-        symbolic_coefficient
+        round_for_calculation(symbolic_coefficient, decimals)
     } else {
-        contributions.iter().map(|item| item.coefficient).sum()
+        round_for_calculation(
+            contributions.iter().map(|item| item.coefficient).sum(),
+            decimals,
+        )
     };
     Ok(ThermalCalculationResult {
         contributions,
@@ -1739,10 +1808,40 @@ fn extremum_mark(diagram: &Diagram) -> &'static str {
     }
 }
 
+/// Округление только на явно показанных этапах учебного расчёта.
+pub fn round_for_calculation(value: f64, decimals: Option<u8>) -> f64 {
+    let Some(decimals) = decimals else {
+        return value;
+    };
+    let scale = 10_f64.powi(i32::from(decimals.min(10)));
+    let scaled = value * scale;
+    if !scaled.is_finite() {
+        return value;
+    }
+    let rounded = scaled.round() / scale;
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
+}
+
+static DISPLAY_DECIMALS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(10);
+
+/// Точность текстового представления не влияет на расчётные значения.
+pub fn set_display_decimals(decimals: u8) {
+    DISPLAY_DECIMALS.store(decimals.min(10), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Компактное представление числа без незначащих нулей.
 pub fn format_number(value: f64) -> String {
+    let precision = DISPLAY_DECIMALS.load(std::sync::atomic::Ordering::Relaxed) as usize;
     let normalized = if value.abs() < 5.0e-13 { 0.0 } else { value };
-    let text = format!("{normalized:.10}");
+    let rounded = round_for_calculation(normalized, Some(precision as u8));
+    let text = format!("{rounded:.precision$}");
+    if normalized != 0.0 && rounded == 0.0 {
+        return format!("{normalized:.precision$e}");
+    }
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
@@ -1850,6 +1949,52 @@ mod tests {
         let result = calculate_displacement(&frame, Rigidity::numeric(4.0).unwrap()).unwrap();
         assert!((result.numeric_displacement().unwrap() - 3.0).abs() < EPS);
         assert_eq!(result.formatted_displacement(), "3");
+    }
+
+    #[test]
+    fn classroom_rounding_changes_mohr_terms_but_preserves_exact_mode() {
+        let frame = Frame {
+            segments: vec![segment(linear(1.234, 1.234), linear(2.345, 2.345))],
+        };
+        let exact = calculate_displacement(&frame, Rigidity::Symbolic).unwrap();
+        let classroom =
+            calculate_displacement_with_rounding(&frame, Rigidity::Symbolic, Some(2)).unwrap();
+        assert!((exact.numerator - 1.234 * 2.345 * 2.0).abs() < EPS);
+        assert_eq!(classroom.contributions[0].load_values, [1.23; 3]);
+        assert_eq!(classroom.contributions[0].unit_values, [2.35; 3]);
+        assert!((classroom.numerator - 5.78).abs() < EPS);
+    }
+
+    #[test]
+    fn small_numeric_alpha_is_not_rounded_to_zero() {
+        let mut rod = Rod::blank("AB".into(), 0, 1);
+        rod.unit_x_diagram = linear(1.0, 1.0);
+        rod.temperature = Some(TemperatureLoad {
+            upper_or_left: 10.0,
+            lower_or_right: 0.0,
+        });
+        let model = StructuralModel {
+            nodes: vec![
+                Node {
+                    id: "A".into(),
+                    position: Point { x: 0.0, y: 0.0 },
+                },
+                Node {
+                    id: "B".into(),
+                    position: Point { x: 2.0, y: 0.0 },
+                },
+            ],
+            rods: vec![rod],
+            target_node: 1,
+            ..Default::default()
+        };
+        let result = calculate_thermal_displacement_components_with_rounding(
+            &model,
+            ThermalExpansion::Numeric(1.2e-5),
+            Some(2),
+        )
+        .unwrap();
+        assert!((result.horizontal.numeric_displacement().unwrap() + 4.8e-4).abs() < EPS);
     }
 
     #[test]
