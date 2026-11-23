@@ -6,8 +6,7 @@
 
 use std::io::Cursor;
 
-use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
-use mohr_frame::{
+use crate::{
     calculate_displacement_components_with_rounding,
     calculate_kinematic_displacement_components_with_rounding,
     calculate_thermal_displacement_components_with_rounding,
@@ -19,6 +18,7 @@ use mohr_frame::{
     IntegrationMethod, KinematicDisplacementComponents, KinematicResult, Rigidity, StructuralModel,
     SupportDirection, ThermalCalculationResult, ThermalDisplacementComponents, ThermalExpansion,
 };
+use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 
 const REPORT_IMAGE_WIDTH: u32 = 1000;
 const REPORT_IMAGE_HEIGHT: u32 = 650;
@@ -748,7 +748,7 @@ fn build_document_xml(
     thermal: &ThermalDisplacementComponents,
     kinematic: &KinematicDisplacementComponents,
 ) -> Result<String, String> {
-    let has_unit = |select: fn(&mohr_frame::Rod) -> &Diagram| {
+    let has_unit = |select: fn(&crate::Rod) -> &Diagram| {
         model
             .rods
             .iter()
@@ -1470,7 +1470,7 @@ fn combined_value(
     }
     let mut terms = Vec::new();
     if effects.force && force_numeric.is_none() && force.numerator.abs() > 1.0e-12 {
-        terms.push(mohr_frame::format_symbolic_force(force.numerator));
+        terms.push(crate::format_symbolic_force(force.numerator));
     }
     if effects.thermal && thermal_numeric.is_none() && thermal.coefficient.abs() > 1.0e-12 {
         terms.push(format!("α · {}", format_number(thermal.coefficient)));
@@ -1501,7 +1501,7 @@ fn integration_formula(method: IntegrationMethod) -> &'static str {
     }
 }
 
-fn substituted_integral(length: f64, item: &mohr_frame::SegmentContribution) -> String {
+fn substituted_integral(length: f64, item: &crate::SegmentContribution) -> String {
     let load = item.load_values.map(format_number);
     let unit = item.unit_values.map(format_number);
     match item.method {
@@ -1528,14 +1528,14 @@ fn substituted_integral(length: f64, item: &mohr_frame::SegmentContribution) -> 
     }
 }
 
-fn force_contribution_text(item: &mohr_frame::SegmentContribution) -> String {
+fn force_contribution_text(item: &crate::SegmentContribution) -> String {
     match item.property {
         Some(value) if value.numeric => format_number(item.integral),
         _ => format!("{} / EI", format_number(item.integral)),
     }
 }
 
-fn thermal_contribution_text(item: &mohr_frame::ThermalRodContribution) -> String {
+fn thermal_contribution_text(item: &crate::ThermalRodContribution) -> String {
     match item.property {
         Some(value) if value.numeric => format_number(item.coefficient),
         _ => format!("α · {}", format_number(item.coefficient)),
@@ -2152,8 +2152,8 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mohr_frame::fem::{FemProject, SupportKind};
-    use mohr_frame::{
+    use crate::fem::{FemProject, SupportKind};
+    use crate::{
         DiagramKind, FiberSide, Node, Ordinate, Point, Rod, SupportDirection, SupportMotion,
     };
 
@@ -2222,7 +2222,7 @@ mod tests {
     fn report_is_a_docx_container_with_document_and_image() {
         let mut model = model();
         model.rods[0].unit_rotation_diagram = model.rods[0].load_diagram.clone();
-        model.rods[0].temperature = Some(mohr_frame::TemperatureLoad {
+        model.rods[0].temperature = Some(crate::TemperatureLoad {
             upper_or_left: 20.0,
             lower_or_right: 10.0,
         });

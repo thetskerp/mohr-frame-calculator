@@ -35,18 +35,32 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      - name: Build
-        run: cargo build --release --locked
+      - name: Install Qt 6.8
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: win64_msvc2022_64
+
+      - name: Build Qt application
+        shell: pwsh
+        run: |
+          cmake -S . -B build/qt -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR" -DRUST_PROFILE=release
+          cmake --build build/qt --config Release --parallel 4
 
       - name: Create Windows archive
         shell: pwsh
         run: |
           $bundle = "release-package\Mohr Frame"
           New-Item -ItemType Directory -Force $bundle | Out-Null
-          Copy-Item "target\release\mohr-frame.exe" "$bundle\Mohr Frame.exe"
+          Copy-Item "build\qt\Release\Mohr Frame.exe" "$bundle\Mohr Frame.exe"
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --dir $bundle "$bundle\Mohr Frame.exe"
+          if (-not (Test-Path "$bundle\platforms\qwindows.dll")) { throw "Qt Windows platform plugin missing" }
           Copy-Item "examples\example-frame.mohr.ron" "$bundle\example-frame.mohr.ron"
+          Copy-Item "templates" "$bundle\templates" -Recurse
           Copy-Item "README.md" "$bundle\README.md"
           Copy-Item "LICENSE" "$bundle\LICENSE"
+          Copy-Item "packaging\LGPL-3.0.txt" "$bundle\LGPL-3.0.txt"
+          Copy-Item "packaging\NOTICE-QT.md" "$bundle\NOTICE-QT.md"
           Copy-Item "assets\OpenGost-LICENSE.txt" "$bundle\OpenGost-LICENSE.txt"
           Compress-Archive -Path $bundle -DestinationPath "Mohr-Frame-Windows-x64.zip"
 
@@ -62,7 +76,7 @@ jobs:
     name: macOS Universal
     runs-on: macos-15
     env:
-      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -78,33 +92,65 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      - name: Build Intel binary
-        run: cargo build --release --locked --target x86_64-apple-darwin
+      - name: Install Qt 6.8
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: clang_64
 
-      - name: Build Apple Silicon binary
-        run: cargo build --release --locked --target aarch64-apple-darwin
+      - name: Verify Qt architectures
+        run: |
+          ARCHS="$(lipo -archs "$QT_ROOT_DIR/lib/QtCore.framework/QtCore")"
+          echo "$ARCHS"
+          [[ "$ARCHS" == *x86_64* && "$ARCHS" == *arm64* ]]
+
+      - name: Build Rust libraries for both architectures
+        run: |
+          export RUSTC="$(rustup which rustc)"
+          cargo build --release --locked --lib --no-default-features --target x86_64-apple-darwin
+          cargo build --release --locked --lib --no-default-features --target aarch64-apple-darwin
+          mkdir -p build/universal
+          lipo -create \
+            target/x86_64-apple-darwin/release/libmohr_frame.a \
+            target/aarch64-apple-darwin/release/libmohr_frame.a \
+            -output build/universal/libmohr_frame.a
+
+      - name: Build universal Qt application
+        run: |
+          cmake -S . -B build/qt-universal \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+            -DMOHR_BUILD_RUST_CORE=OFF \
+            -DMOHR_RUST_LIBRARY="$PWD/build/universal/libmohr_frame.a" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/qt-universal --parallel 4
+          "$QT_ROOT_DIR/bin/macdeployqt" "build/qt-universal/Mohr Frame.app"
+          mkdir -p "build/qt-universal/Mohr Frame.app/Contents/Resources"
+          cp packaging/macos/qt.conf "build/qt-universal/Mohr Frame.app/Contents/Resources/qt.conf"
+          test -f "build/qt-universal/Mohr Frame.app/Contents/PlugIns/platforms/libqcocoa.dylib"
+          test -f "build/qt-universal/Mohr Frame.app/Contents/Resources/qt.conf"
+          test -f "build/qt-universal/Mohr Frame.app/Contents/Frameworks/QtWidgets.framework/QtWidgets"
 
       - name: Create universal app archive
         run: |
           BUNDLE_DIR="release-package/Mohr Frame"
           APP_DIR="$BUNDLE_DIR/Mohr Frame.app"
-          mkdir -p "$APP_DIR/Contents/MacOS"
-          lipo -create \
-            target/x86_64-apple-darwin/release/mohr-frame \
-            target/aarch64-apple-darwin/release/mohr-frame \
-            -output "$APP_DIR/Contents/MacOS/mohr-frame"
-          cp packaging/macos/Info.plist "$APP_DIR/Contents/Info.plist"
-          chmod +x "$APP_DIR/Contents/MacOS/mohr-frame"
+          mkdir -p "$BUNDLE_DIR"
+          cp -R "build/qt-universal/Mohr Frame.app" "$APP_DIR"
           /usr/bin/codesign --force --deep --sign - "$APP_DIR"
           cp examples/example-frame.mohr.ron "$BUNDLE_DIR/example-frame.mohr.ron"
+          cp -R templates "$BUNDLE_DIR/templates"
           cp README.md "$BUNDLE_DIR/README.md"
           cp LICENSE "$BUNDLE_DIR/LICENSE"
+          cp packaging/LGPL-3.0.txt "$BUNDLE_DIR/LGPL-3.0.txt"
+          cp packaging/NOTICE-QT.md "$BUNDLE_DIR/NOTICE-QT.md"
           cp assets/OpenGost-LICENSE.txt "$BUNDLE_DIR/OpenGost-LICENSE.txt"
           ditto -c -k --sequesterRsrc --keepParent \
             "$BUNDLE_DIR" "Mohr-Frame-macOS-universal.zip"
 
       - name: Verify universal binary
-        run: lipo -info "release-package/Mohr Frame/Mohr Frame.app/Contents/MacOS/mohr-frame"
+        run: lipo -info "release-package/Mohr Frame/Mohr Frame.app/Contents/MacOS/Mohr Frame"
 
       - name: Upload macOS archive
         uses: actions/upload-artifact@v4

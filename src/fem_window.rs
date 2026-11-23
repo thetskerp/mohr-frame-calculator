@@ -1,11 +1,11 @@
 //! Отдельное окно для нагрузок, опор, решения МКЭ и просмотра эпюр.
 
 use crate::canvas::{position_epure_label, CanvasCamera, EpureLabelSpec};
-use crate::docx_report::FemReportSections;
 use eframe::egui::{
     self, Align2, Color32, ComboBox, CursorIcon, DragValue, FontId, PointerButton, Pos2, Rect,
     Response, Sense, Shape, Stroke, Vec2,
 };
+use mohr_frame::docx_report::FemReportSections;
 use mohr_frame::{
     fem::{
         FemProject, FemResult, LoadCaseResult, PointLoad, SectionForces, StiffnessMode, SupportKind,

@@ -7,7 +7,12 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod bridge;
+pub mod docx_report;
 pub mod fem;
+pub mod import;
+pub mod project;
+pub mod view_state;
 
 const EPS: f64 = 1.0e-9;
 

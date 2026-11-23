@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/fonts">
+    <file alias="OpenGostTypeA-Regular.ttf">../assets/OpenGostTypeA-Regular.ttf</file>
+  </qresource>
+</RCC>

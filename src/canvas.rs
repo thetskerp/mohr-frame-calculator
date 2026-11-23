@@ -5,14 +5,13 @@ use eframe::egui::{
     RichText, Sense, Shape, Stroke, Vec2,
 };
 use mohr_frame::{format_number, Diagram, Point, Rod, StructuralModel, SupportDirection};
-use serde::{Deserialize, Serialize};
 
 pub const GOST_FONT_FAMILY: &str = "gost_type_a";
 
-const MIN_CAMERA_ZOOM: f32 = 0.2;
-const MAX_CAMERA_ZOOM: f32 = 10.0;
-const MIN_DIAGRAM_SCALE: f32 = 0.1;
-const MAX_DIAGRAM_SCALE: f32 = 10.0;
+pub use mohr_frame::view_state::{CanvasCamera, CanvasViewState, DragOrigin};
+use mohr_frame::view_state::{
+    MAX_CAMERA_ZOOM, MAX_DIAGRAM_SCALE, MIN_CAMERA_ZOOM, MIN_DIAGRAM_SCALE,
+};
 
 /// Вид эпюры. Порядок вариантов стабилен: он задаёт индекс
 /// её индивидуального масштаба в `CanvasViewState`.
@@ -45,97 +44,6 @@ impl DiagramChoice {
     }
 }
 
-/// Общая камера для всех представлений рамы.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct CanvasCamera {
-    /// Множитель автомасштаба.
-    pub zoom: f32,
-    /// Смещение центра камеры в мировых координатах.
-    pub center_offset: [f32; 2],
-}
-
-impl Default for CanvasCamera {
-    fn default() -> Self {
-        Self {
-            zoom: 1.0,
-            center_offset: [0.0, 0.0],
-        }
-    }
-}
-
-impl CanvasCamera {
-    fn pan_by(&mut self, screen_delta: Vec2, screen_scale: f32) {
-        self.center_offset[0] -= screen_delta.x / screen_scale;
-        self.center_offset[1] += screen_delta.y / screen_scale;
-    }
-
-    fn pan_from_drag(&mut self, origin: DragOrigin, total_delta: Vec2) {
-        self.center_offset = origin.center_offset;
-        self.pan_by(total_delta, origin.screen_scale);
-    }
-}
-
-fn default_ordinate_scales() -> Vec<f32> {
-    vec![1.0; 9]
-}
-
-/// Сохраняемое состояние вида: общая камера и отдельная
-/// высота каждой эпюры.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CanvasViewState {
-    #[serde(default)]
-    pub camera: CanvasCamera,
-    #[serde(default = "default_ordinate_scales")]
-    pub ordinate_scales: Vec<f32>,
-    /// Служебные данные текущего жеста не входят в файл проекта.
-    #[serde(skip)]
-    drag_origin: Option<DragOrigin>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct DragOrigin {
-    center_offset: [f32; 2],
-    screen_scale: f32,
-}
-
-impl Default for CanvasViewState {
-    fn default() -> Self {
-        Self {
-            camera: CanvasCamera::default(),
-            ordinate_scales: default_ordinate_scales(),
-            drag_origin: None,
-        }
-    }
-}
-
-impl CanvasViewState {
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    fn diagram_scale(&self, choice: DiagramChoice) -> f32 {
-        self.ordinate_scales
-            .get(choice.index())
-            .copied()
-            .unwrap_or(1.0)
-    }
-
-    fn scale_diagram(&mut self, choice: DiagramChoice, factor: f32) {
-        if self.ordinate_scales.len() < 9 {
-            self.ordinate_scales.resize(9, 1.0);
-        }
-        let scale = &mut self.ordinate_scales[choice.index()];
-        *scale = (*scale * factor).clamp(MIN_DIAGRAM_SCALE, MAX_DIAGRAM_SCALE);
-    }
-
-    fn set_diagram_scale(&mut self, choice: DiagramChoice, scale: f32) {
-        if self.ordinate_scales.len() < 9 {
-            self.ordinate_scales.resize(9, 1.0);
-        }
-        self.ordinate_scales[choice.index()] = scale.clamp(MIN_DIAGRAM_SCALE, MAX_DIAGRAM_SCALE);
-    }
-}
-
 pub struct CanvasOptions<'a> {
     pub title: &'a str,
     pub diagram: Option<DiagramChoice>,
@@ -155,7 +63,7 @@ pub fn frame_canvas(
         ui.horizontal(|ui| {
             ui.label(RichText::new(options.title).strong());
             if let Some(choice) = options.diagram {
-                let mut scale = view_state.diagram_scale(choice);
+                let mut scale = view_state.diagram_scale(choice.index());
                 ui.add(
                     DragValue::new(&mut scale)
                         .range(MIN_DIAGRAM_SCALE..=MAX_DIAGRAM_SCALE)
@@ -163,7 +71,7 @@ pub fn frame_canvas(
                         .prefix("Высота ×"),
                 )
                 .on_hover_text("Масштаб ординат этой эпюры; также Shift + колесо над холстом");
-                view_state.set_diagram_scale(choice, scale);
+                view_state.set_diagram_scale(choice.index(), scale);
             }
         });
         let size = Vec2::new(ui.available_width(), options.height - 26.0);
@@ -206,7 +114,9 @@ pub fn frame_canvas(
                 if let Some(total_delta) = response.total_drag_delta() {
                     // total_drag_delta считается от начала жеста. drag_delta даёт
                     // только сдвиг за кадр и здесь почти обнулял перетаскивание.
-                    view_state.camera.pan_from_drag(*origin, total_delta);
+                    view_state
+                        .camera
+                        .pan_from_drag(*origin, total_delta.x, total_delta.y);
                 }
             }
             if response.drag_stopped_by(PointerButton::Primary) {
@@ -226,7 +136,7 @@ pub fn frame_canvas(
             if amount.abs() > f32::EPSILON {
                 let factor = (amount * 0.003).exp();
                 if let (true, Some(choice)) = (shift, options.diagram) {
-                    view_state.scale_diagram(choice, factor);
+                    view_state.scale_diagram(choice.index(), factor);
                 } else if let Some(pointer) = pointer {
                     zoom_about_pointer(model, rect, pointer, factor, &mut view_state.camera);
                 }
@@ -244,7 +154,7 @@ pub fn frame_canvas(
                 &transform,
                 choice,
                 options.show_values,
-                view_state.diagram_scale(choice),
+                view_state.diagram_scale(choice.index()),
             );
         }
         draw_baselines(&painter, model, &transform);
@@ -809,11 +719,14 @@ mod tests {
     #[test]
     fn diagram_scales_are_independent_and_bounded() {
         let mut view = CanvasViewState::default();
-        view.scale_diagram(DiagramChoice::Load, 2.0);
-        assert_eq!(view.diagram_scale(DiagramChoice::Load), 2.0);
-        assert_eq!(view.diagram_scale(DiagramChoice::UnitX), 1.0);
-        view.scale_diagram(DiagramChoice::Load, 100.0);
-        assert_eq!(view.diagram_scale(DiagramChoice::Load), MAX_DIAGRAM_SCALE);
+        view.scale_diagram(DiagramChoice::Load.index(), 2.0);
+        assert_eq!(view.diagram_scale(DiagramChoice::Load.index()), 2.0);
+        assert_eq!(view.diagram_scale(DiagramChoice::UnitX.index()), 1.0);
+        view.scale_diagram(DiagramChoice::Load.index(), 100.0);
+        assert_eq!(
+            view.diagram_scale(DiagramChoice::Load.index()),
+            MAX_DIAGRAM_SCALE
+        );
     }
 
     #[test]
@@ -823,8 +736,8 @@ mod tests {
             center_offset: camera.center_offset,
             screen_scale: 10.0,
         };
-        camera.pan_from_drag(origin, Vec2::new(10.0, 5.0));
-        camera.pan_from_drag(origin, Vec2::new(25.0, 15.0));
+        camera.pan_from_drag(origin, 10.0, 5.0);
+        camera.pan_from_drag(origin, 25.0, 15.0);
         assert_eq!(camera.center_offset, [-2.5, 1.5]);
     }
 

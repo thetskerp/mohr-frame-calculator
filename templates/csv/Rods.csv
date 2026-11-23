@@ -1,0 +1,3 @@
+id,start,end,h,ei_preset,alpha_preset,hinge_start,hinge_end,t_upper,t_lower
+AB,A,B,0.5,1,1,false,false,,
+BC,B,C,0.5,1,1,false,false,,

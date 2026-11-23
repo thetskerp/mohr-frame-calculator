@@ -1,21 +1,25 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod canvas;
-mod docx_report;
 mod fem_window;
-mod project;
 mod property_editor;
 mod table_editor;
 
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use canvas::{frame_canvas, CanvasOptions, CanvasViewState, DiagramChoice, GOST_FONT_FAMILY};
-use docx_report::{build_fem_word_report, build_word_report_with_rounding};
 use eframe::egui::{
     self, Align2, Color32, ComboBox, DragValue, FontData, FontDefinitions, FontFamily, RichText,
     Vec2,
 };
 use fem_window::{FemWindow, ReactionDisplay};
+use mohr_frame::docx_report::{build_fem_word_report, build_word_report_with_rounding};
+use mohr_frame::project::{
+    export_for_v050, export_for_v050_for_path, load_project_from_path, project_name_from_path,
+    project_paths, project_paths_from_scheme, project_root_dir, sanitize_project_name_input,
+    save_fem_word_report, save_fem_word_report_for_path, save_project, save_project_to_path,
+    save_word_report, save_word_report_for_path, ProjectData,
+};
 use mohr_frame::{
     calculate_displacement_components_with_rounding,
     calculate_kinematic_displacement_components_with_rounding,
@@ -24,12 +28,6 @@ use mohr_frame::{
     FiberSide, Frame, KinematicResult, Node, Ordinate, Point, PropertyPreset, Rigidity, Rod,
     SegmentOrientation, StructuralModel, SupportDirection, SupportMotion, TemperatureLoad,
     ThermalCalculationResult, ThermalExpansion,
-};
-use project::{
-    export_for_v050, export_for_v050_for_path, load_project_from_path, project_name_from_path,
-    project_paths, project_paths_from_scheme, project_root_dir, sanitize_project_name_input,
-    save_fem_word_report, save_fem_word_report_for_path, save_project, save_project_to_path,
-    save_word_report, save_word_report_for_path, ProjectData,
 };
 use property_editor::PropertyEditor;
 use rfd::FileDialog;

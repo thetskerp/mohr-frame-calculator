@@ -34,6 +34,20 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+      - name: Install Qt 6.8
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: clang_64
+
+      - name: Build Qt application
+        run: |
+          cmake -S . -B build/qt -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0
+          cmake --build build/qt --parallel 4
+
+      - name: Smoke test Qt application
+        run: QT_QPA_PLATFORM=offscreen "build/qt/Mohr Frame.app/Contents/MacOS/Mohr Frame" --smoke-test
+
   windows:
     name: Windows build
     runs-on: windows-latest
@@ -49,5 +63,14 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
-      - name: Build release binary
-        run: cargo build --release --locked
+      - name: Install Qt 6.8
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: win64_msvc2022_64
+
+      - name: Build Qt application
+        shell: pwsh
+        run: |
+          cmake -S . -B build/qt -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR" -DRUST_PROFILE=release
+          cmake --build build/qt --config Release --parallel 4

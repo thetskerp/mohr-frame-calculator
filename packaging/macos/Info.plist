@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>Метод Мора</string>
     <key>CFBundleExecutable</key>
-    <string>mohr-frame</string>
+    <string>Mohr Frame</string>
     <key>CFBundleIdentifier</key>
     <string>ru.mohr-frame.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -19,11 +19,11 @@
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.education</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.8.2</string>
+    <string>0.9.0</string>
     <key>CFBundleVersion</key>
-    <string>13</string>
+    <string>14</string>
     <key>LSMinimumSystemVersion</key>
-    <string>11.0</string>
+    <string>12.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

@@ -6,12 +6,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mohr_frame::{
+use crate::{
     fem::FemProject, Diagram, EffectsSelection, Node, Rigidity, StructuralModel, ThermalExpansion,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::canvas::CanvasViewState;
+use crate::view_state::CanvasViewState;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 const PROJECT_FORMAT_ID: &str = "mohr-frame-project";
@@ -346,8 +346,8 @@ struct LegacyRodExport<'a> {
     unit_y_diagram: &'a Diagram,
 }
 
-impl<'a> From<&'a mohr_frame::Rod> for LegacyRodExport<'a> {
-    fn from(rod: &'a mohr_frame::Rod) -> Self {
+impl<'a> From<&'a crate::Rod> for LegacyRodExport<'a> {
+    fn from(rod: &'a crate::Rod) -> Self {
         Self {
             id: &rod.id,
             start_node: rod.start_node,
@@ -502,7 +502,7 @@ pub fn project_root_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mohr_frame::{Diagram, Node, Point, SupportDirection, SupportMotion};
+    use crate::{Diagram, Node, Point, SupportDirection, SupportMotion};
 
     fn sample_data() -> ProjectData {
         ProjectData {
@@ -517,7 +517,7 @@ mod tests {
                         position: Point { x: 1.0, y: 0.0 },
                     },
                 ],
-                rods: vec![mohr_frame::Rod {
+                rods: vec![crate::Rod {
                     id: "AB".into(),
                     start_node: 0,
                     end_node: 1,
@@ -599,24 +599,22 @@ mod tests {
         let mut data = sample_data();
         data.calculation_rounding = true;
         data.calculation_decimals = 3;
-        data.model
-            .rigidity_presets
-            .push(mohr_frame::PropertyPreset {
-                id: 7,
-                name: "Балка 2".into(),
-                value: mohr_frame::PropertyValue {
-                    numeric: true,
-                    mantissa: 2.0,
-                    exponent: 5,
-                    ..mohr_frame::PropertyValue::default()
-                },
-            });
-        data.model.thermal_presets.push(mohr_frame::PropertyPreset {
+        data.model.rigidity_presets.push(crate::PropertyPreset {
+            id: 7,
+            name: "Балка 2".into(),
+            value: crate::PropertyValue {
+                numeric: true,
+                mantissa: 2.0,
+                exponent: 5,
+                ..crate::PropertyValue::default()
+            },
+        });
+        data.model.thermal_presets.push(crate::PropertyPreset {
             id: 8,
             name: "Сталь".into(),
-            value: mohr_frame::PropertyValue {
+            value: crate::PropertyValue {
                 symbolic_factor: 3.0,
-                ..mohr_frame::PropertyValue::default()
+                ..crate::PropertyValue::default()
             },
         });
         data.model.rods[0].rigidity_preset_id = Some(7);
@@ -633,7 +631,7 @@ mod tests {
             unit_rotation_reaction: 0.5,
         });
         data.fem.reconcile(&data.model);
-        data.fem.nodes[0].support = mohr_frame::fem::SupportKind::Fixed;
+        data.fem.nodes[0].support = crate::fem::SupportKind::Fixed;
         data.fem.members[0].ea = 2.0e5;
         data.fem.members[0].ei = 3.0e3;
         data.fem.members[0].qy = -5.0;
