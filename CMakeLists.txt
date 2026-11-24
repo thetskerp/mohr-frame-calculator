@@ -62,7 +62,8 @@ if(APPLE)
 endif()
 if(WIN32)
   target_link_libraries(mohr-frame-qt PRIVATE
-    ws2_32 userenv bcrypt ntdll iphlpapi advapi32 crypt32 secur32)
+    ws2_32 userenv bcrypt ntdll iphlpapi advapi32 crypt32 secur32
+    synchronization)
 endif()
 set_target_properties(mohr-frame-qt PROPERTIES
   WIN32_EXECUTABLE TRUE
