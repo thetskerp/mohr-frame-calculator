@@ -421,13 +421,13 @@ impl MemberResult {
     pub fn at(&self, x: f64) -> SectionForces {
         let x = x.clamp(0.0, self.length);
         let mut n = -self.end_forces[0] - self.qx_local * x;
-        let mut q = -self.end_forces[1] - self.qy_local * x;
+        let mut q = self.end_forces[1] + self.qy_local * x;
         let mut m = -self.end_forces[2] + self.end_forces[1] * x + self.qy_local * x * x / 2.0;
         for p in &self.point_loads_local {
             let a = p.xi * self.length;
             if x + 1e-10 >= a {
                 n -= p.fx;
-                q -= p.fy;
+                q += p.fy;
                 m += p.fy * (x - a) - p.mz;
             }
         }
@@ -444,7 +444,7 @@ impl MemberResult {
             number(self.qx_local)
         );
         let mut q = format!(
-            "Q(x) = −({}) − ({})·x",
+            "Q(x) = ({}) + ({})·x",
             number(self.end_forces[1]),
             number(self.qy_local)
         );
@@ -457,7 +457,7 @@ impl MemberResult {
         for p in &self.point_loads_local {
             let a = number(p.xi * self.length);
             n.push_str(&format!(" − ({})·H(x−{a})", number(p.fx)));
-            q.push_str(&format!(" − ({})·H(x−{a})", number(p.fy)));
+            q.push_str(&format!(" + ({})·H(x−{a})", number(p.fy)));
             m.push_str(&format!(
                 " + [({})·(x−{a}) − ({})]·H(x−{a})",
                 number(p.fy),
@@ -492,8 +492,7 @@ impl MemberResult {
             breaks.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
             for pair in breaks.windows(2) {
                 let middle = (pair[0] + pair[1]) / 2.0;
-                let slope = self.at(middle).q + self.qy_local * middle;
-                let x = slope / self.qy_local;
+                let x = middle - self.at(middle).q / self.qy_local;
                 if x > pair[0] + 1e-9 && x < pair[1] - 1e-9 {
                     positions.push((x, format!("экстремум x={}", crate::format_number(x))));
                 }
@@ -1236,6 +1235,9 @@ mod tests {
             }
         }
         near(analytical.actual.members[0].at(2.0).m, 10.0);
+        near(analytical.actual.members[0].at(0.0).q, 10.0);
+        near(analytical.actual.members[0].at(2.0).q, 0.0);
+        near(analytical.actual.members[0].at(4.0).q, -10.0);
     }
 
     #[test]

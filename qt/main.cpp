@@ -14,7 +14,7 @@ int main(int argc, char **argv) {
   QApplication app(argc, argv);
   app.setApplicationName("Mohr Frame");
   app.setOrganizationName("Mohr Frame");
-  app.setApplicationVersion("0.9.0");
+  app.setApplicationVersion("0.9.1");
   QApplication::setStyle(QStyleFactory::create("Fusion"));
   app.setFont(QFont("Arial", 10));
   QFontDatabase::addApplicationFont(":/fonts/OpenGostTypeA-Regular.ttf");

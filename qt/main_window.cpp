@@ -626,7 +626,7 @@ void MainWindow::exportWord(bool fem) {
 void MainWindow::updateTitle() {
   const QString path = qs(mohr::document_path(*document_));
   setWindowTitle((path.isEmpty() ? tr("Новая схема") : QFileInfo(path).fileName()) +
-                 " — Mohr Frame 0.9.0");
+                 " — Mohr Frame 0.9.1");
 }
 void MainWindow::restoreUiSettings() {
   QSettings s;
